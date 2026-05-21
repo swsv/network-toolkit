@@ -6,11 +6,7 @@
 [Script]
 http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓Token
 
-http-request ^https:\/\/app-services\.lynkco\.com\.cn\/app\/v1\/task\/getShareCode script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓ShareCode模板
-
-http-request ^https:\/\/h5\.lynkco\.com\/.*shareCode= script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓ShareCode备用
-
 cron "23 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=60, tag=领克每日自动分享
 
 [MITM]
-hostname = h5-api.lynkco.com, h5.lynkco.com, app-services.lynkco.com.cn
+hostname = h5-api.lynkco.com, h5.lynkco.com

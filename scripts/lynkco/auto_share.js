@@ -4,66 +4,54 @@
 
 功能说明：
 1. 自动抓取 token / svcsid。
-2. 自动抓取 shareCode。
+2. 自动抓取 getShareCode 请求模板。
 3. 定时从探索页获取文章列表。
 4. 自动选择一篇未分享过的文章。
 5. 自动请求文章详情，相当于进入文章。
 6. 自动上报 ReadCount。
 7. 自动上报 ShareCount。
-8. 自动调用 shareReporting，完成 Co 积分分享任务。
+8. 自动调用 getShareCode 获取新的 shareCode。
+9. 自动调用 shareReporting，完成 Co 积分分享任务。
 
 Loon 插件配置：
 
 [Script]
-http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=lynkco_auto_share.js, requires-body=false, timeout=30, tag=领克抓Token
-http-request ^https:\/\/h5\.lynkco\.com\/.*shareCode= script-path=lynkco_auto_share.js, requires-body=false, timeout=30, tag=领克抓ShareCode
-cron "50 11 * * *" script-path=lynkco_auto_share.js, timeout=60, tag=领克每日自动分享
+http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=auto_share.js, requires-body=false, timeout=30, tag=领克抓Token
+http-request ^https:\/\/app-services\.lynkco\.com\.cn\/app\/v1\/task\/getShareCode script-path=auto_share.js, requires-body=false, timeout=30, tag=领克抓ShareCode模板
+cron "50 11 * * *" script-path=auto_share.js, timeout=60, tag=领克每日自动分享
 
 [MITM]
-hostname = h5-api.lynkco.com, h5.lynkco.com
+hostname = h5-api.lynkco.com, h5.lynkco.com, app-services.lynkco.com.cn
 
 首次使用步骤：
 1. 打开 Loon，开启代理。
 2. 开启 MITM，并安装、信任 Loon 证书。
 3. 打开领克 App → 探索 → 随便点进一篇文章。
    这一步用于抓取当前账号的 token / svcsid。
-4. 在文章页面点击分享 → 复制链接。
-5. 把复制出来的分享链接粘贴到 Safari 打开一次。
-   这一步用于抓取当前账号的 shareCode。
-6. token / svcsid / shareCode 都抓到后，后续就可以自动执行。
+4. 在文章页面点击 分享 → 复制链接。
+   这一步用于抓取 getShareCode 请求模板。
+5. token / svcsid / getShareCode 模板都抓到后，后续就可以自动执行。
 
-日常使用：
-1. 初始化完成后，不需要每天手动打开文章。
-2. 脚本会每天按照 cron 时间自动执行。
-3. 默认执行时间是每天 11:50。
-4. 脚本会自动获取探索文章列表，并选择一篇未使用过的文章完成分享上报。
-5. 每次成功执行后，会记录本次使用过的文章 ID，后续优先跳过已使用文章。
-
-关于账号数据：
-1. token / svcsid / shareCode 都是当前账号自己的数据。
-2. 每个使用者都需要用自己的领克账号完成首次初始化。
-3. 不要直接使用别人已经抓好的 token / svcsid / shareCode。
-4. 脚本本身可以分享，但账号抓取数据不要共用。
-
-关于 shareCode：
-1. shareCode 通常只需要初始化一次。
-2. 每天变化的是文章 ID，也就是 articleId / businessNo。
-3. 脚本每天会自动换新的文章 ID / businessNo。
-4. 如果 shareReporting 返回非 success，再重新复制一次文章分享链接并用 Safari 打开，刷新 shareCode。
-
-如果后续失败：
-请发执行log给我
+注意：
+getShareCode 走 app-services.lynkco.com.cn，和 h5-api 的签名体系不完全一样。
+当前脚本会复用抓包得到的 getShareCode 请求头模板，并自动替换文章 ID 相关参数。
+如果后续 getShareCode 返回 Invalid Signature，说明 203760416 这套原生签名需要继续补。
 */
 
 const STORE_TOKEN = "lynkco_token";
 const STORE_SVCSID = "lynkco_svcsid";
-const STORE_SHARE_CODE = "lynkco_share_code";
 const STORE_USED_IDS = "lynkco_used_article_ids";
+const STORE_SHARE_CODE = "lynkco_share_code";
+const STORE_SHARE_CODE_HEADERS = "lynkco_share_code_headers";
 
 const APP_CODE = "3fa3314998bd4195a9fe2df3e85e6a12";
 const APP_ID = "59701c08ed454a43a9b";
 const CA_KEY = "204644386";
 const CA_SECRET = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
+
+const H5_API_HOST = "https://h5-api.lynkco.com";
+const H5_HOST = "https://h5.lynkco.com";
+const APP_SERVICE_HOST = "https://app-services.lynkco.com.cn";
 
 function log(msg) {
   console.log(String(msg));
@@ -98,12 +86,32 @@ function getHeader(headers, name) {
   return found ? headers[found] : "";
 }
 
+function setHeader(headers, name, value) {
+  const keys = Object.keys(headers);
+  const found = keys.find(k => k.toLowerCase() === name.toLowerCase());
+  if (found) {
+    headers[found] = value;
+  } else {
+    headers[name] = value;
+  }
+}
+
+function delHeader(headers, name) {
+  const keys = Object.keys(headers);
+  const found = keys.find(k => k.toLowerCase() === name.toLowerCase());
+  if (found) delete headers[found];
+}
+
 function uuid() {
   return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, c => {
     const r = Math.random() * 16 | 0;
     const v = c === "x" ? r : (r & 0x3 | 0x8);
     return v.toString(16);
   });
+}
+
+function uuidUpper() {
+  return uuid().toUpperCase();
 }
 
 function request(method, url, headers, body) {
@@ -368,7 +376,7 @@ function canonicalizePathForSign(pathWithQuery) {
   return path + "?" + canonicalQuery;
 }
 
-function buildSignedHeaders(method, pathWithQuery) {
+function buildH5SignedHeaders(method, pathWithQuery) {
   const token = read(STORE_TOKEN);
   const svcsid = read(STORE_SVCSID);
 
@@ -399,7 +407,7 @@ function buildSignedHeaders(method, pathWithQuery) {
 
   return {
     "svcsid": svcsid || token || "",
-    "origin": "https://h5.lynkco.com",
+    "origin": H5_HOST,
     "x-ca-signature-headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
     "x-ca-key": CA_KEY,
     "appversioncode": "4.1.9",
@@ -411,7 +419,7 @@ function buildSignedHeaders(method, pathWithQuery) {
     "authorization": `APPCODE ${APP_CODE}`,
     "appversionname": "40109027",
     "x-ca-signature": signature,
-    "referer": "https://h5.lynkco.com/",
+    "referer": H5_HOST + "/",
     "accept-language": "zh-CN,zh-Hans;q=0.9",
     "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/4.1.9 appVersionName/40109027",
     "acl-app": "BUYER",
@@ -424,11 +432,13 @@ function logStoredState() {
   const token = read(STORE_TOKEN);
   const svcsid = read(STORE_SVCSID);
   const shareCode = read(STORE_SHARE_CODE);
+  const template = read(STORE_SHARE_CODE_HEADERS);
   const usedRaw = read(STORE_USED_IDS) || "[]";
 
   log("Stored token = " + mask(token, 12, 8));
   log("Stored svcsid = " + mask(svcsid, 12, 8));
   log("Stored shareCode = " + mask(shareCode, 12, 8));
+  log("Stored getShareCode template = " + (template ? "yes" : "empty"));
   log("Stored used ids = " + usedRaw);
 }
 
@@ -437,6 +447,34 @@ function handleHttpRequest() {
   const headers = $request.headers || {};
 
   log("HTTP_REQUEST URL = " + url);
+
+  if (url.includes("app-services.lynkco.com.cn/app/v1/task/getShareCode")) {
+    write(JSON.stringify(headers), STORE_SHARE_CODE_HEADERS);
+
+    const token = getHeader(headers, "token");
+    const svcsid = getHeader(headers, "svcsid");
+    const riskInfo = getHeader(headers, "risk_request_info");
+    const caKey = getHeader(headers, "x-ca-key");
+    const signatureHeaders = getHeader(headers, "x-ca-signature-headers");
+
+    if (token) {
+      write(token, STORE_TOKEN);
+      log("token saved from getShareCode = " + mask(token, 12, 8));
+    }
+
+    if (svcsid) {
+      write(svcsid, STORE_SVCSID);
+      log("svcsid saved from getShareCode = " + mask(svcsid, 12, 8));
+    }
+
+    log("getShareCode x-ca-key = " + caKey);
+    log("getShareCode signature headers = " + signatureHeaders);
+    log("getShareCode risk_request_info = " + String(riskInfo || "").slice(0, 300));
+
+    notify("LynkCo getShareCode template saved", "Ready for auto shareCode", "OK");
+    $done({});
+    return;
+  }
 
   const token = getHeader(headers, "token");
   const svcsid = getHeader(headers, "svcsid");
@@ -458,9 +496,7 @@ function handleHttpRequest() {
       const shareCode = decodeURIComponent(m[1]);
       write(shareCode, STORE_SHARE_CODE);
       log("shareCode saved = " + mask(shareCode, 12, 8));
-      notify("LynkCo shareCode saved", "Ready for auto run", mask(shareCode, 12, 8));
-    } else {
-      notify("LynkCo shareCode failed", "Cannot parse shareCode", url.slice(0, 100));
+      notify("LynkCo shareCode saved", "Fallback shareCode saved", mask(shareCode, 12, 8));
     }
   } else if (token || svcsid) {
     notify("LynkCo token saved", "Ready for article request", "token/svcsid OK");
@@ -590,40 +626,121 @@ function saveUsedArticle(id) {
   log("Updated used article ids = " + JSON.stringify(used));
 }
 
+function buildShareUrl(articleId) {
+  const routeUrl = `/pages/exploration/article/index.js?id=${articleId}`;
+  return (
+    H5_HOST +
+    "/app-h5/dist/web/pages/exploration/article/index.html" +
+    "?id=" + articleId +
+    "&isShare=" + encodeURIComponent("lynkco://wx/?routeUrl=" + routeUrl)
+  );
+}
+
+function buildGetShareCodeHeaders(articleId) {
+  const raw = read(STORE_SHARE_CODE_HEADERS);
+
+  if (!raw) {
+    throw new Error("Missing getShareCode headers template");
+  }
+
+  let headers = {};
+  try {
+    headers = JSON.parse(raw);
+  } catch (e) {
+    throw new Error("Invalid getShareCode headers template");
+  }
+
+  const now = Date.now();
+  const openTimeStamp = new Date(now + 8 * 60 * 60 * 1000)
+    .toISOString()
+    .replace("T", " ")
+    .slice(0, 19);
+
+  const token = read(STORE_TOKEN);
+  const svcsid = read(STORE_SVCSID);
+
+  if (token) setHeader(headers, "token", token);
+  if (svcsid) setHeader(headers, "svcsid", svcsid);
+
+  setHeader(headers, "risk_type", "1");
+  setHeader(headers, "risk_request_info", JSON.stringify({
+    openTimeStamp: openTimeStamp,
+    shareContentType: 1,
+    shareContentURL: buildShareUrl(articleId)
+  }));
+
+  delHeader(headers, ":scheme");
+  delHeader(headers, ":authority");
+  delHeader(headers, ":path");
+  delHeader(headers, ":method");
+  delHeader(headers, "host");
+  delHeader(headers, "content-length");
+
+  return headers;
+}
+
+async function getNewShareCode(articleId) {
+  const url = APP_SERVICE_HOST + "/app/v1/task/getShareCode";
+  const headers = buildGetShareCodeHeaders(articleId);
+
+  log("Request getShareCode articleId = " + articleId);
+  log("getShareCode risk_request_info = " + String(getHeader(headers, "risk_request_info")).slice(0, 400));
+  log("getShareCode x-ca-key = " + getHeader(headers, "x-ca-key"));
+  log("getShareCode x-ca-signature = " + mask(getHeader(headers, "x-ca-signature"), 8, 8));
+
+  const ret = await request("GET", url, headers);
+
+  log("getShareCode HTTP = " + ret.resp.status);
+  log("getShareCode body = " + String(ret.data || "").slice(0, 600));
+
+  let obj = {};
+  try {
+    obj = JSON.parse(ret.data || "{}");
+  } catch (e) {}
+
+  if (Number(ret.resp.status) === 200 && obj.code === "success" && obj.data) {
+    write(obj.data, STORE_SHARE_CODE);
+    log("new shareCode saved = " + mask(obj.data, 12, 8));
+    return obj.data;
+  }
+
+  throw new Error("getShareCode failed: " + String(ret.data || ""));
+}
+
 async function runCron() {
   log("LynkCo auto share start");
   logStoredState();
 
   const token = read(STORE_TOKEN);
   const svcsid = read(STORE_SVCSID);
-  const shareCode = read(STORE_SHARE_CODE);
+  const shareCodeTemplate = read(STORE_SHARE_CODE_HEADERS);
 
   log("token = " + (token ? "yes" : "empty"));
   log("svcsid = " + (svcsid ? "yes" : "empty"));
-  log("shareCode = " + (shareCode ? "yes" : "empty"));
+  log("getShareCode template = " + (shareCodeTemplate ? "yes" : "empty"));
 
   if (!token && !svcsid) {
-    notify("LynkCo auto share failed", "Missing token", "Open LynkCo App article once");
+    notify("LynkCo auto share failed", "Missing token", "打开领克 App 探索文章一次");
     $done({});
     return;
   }
 
-  if (!shareCode) {
-    notify("LynkCo auto share failed", "Missing shareCode", "Copy article share link and open it in Safari once");
+  if (!shareCodeTemplate) {
+    notify("LynkCo auto share failed", "Missing getShareCode template", "打开文章后点击分享并复制链接一次");
     $done({});
     return;
   }
 
   try {
     const listPath = `/app/explore/home-page/v2/page/pull?pageNo=1&pageSize=10&articleTypes=`;
-    const listUrl = `https://h5-api.lynkco.com${listPath}`;
+    const listUrl = `${H5_API_HOST}${listPath}`;
 
     log("Request article list: " + listUrl);
 
     const listRet = await request(
       "GET",
       listUrl,
-      buildSignedHeaders("GET", listPath)
+      buildH5SignedHeaders("GET", listPath)
     );
 
     log("Article list HTTP = " + listRet.resp.status);
@@ -678,7 +795,7 @@ async function runCron() {
     log("Selected article title = " + title);
 
     const detailPath = `/app/explore/home-page/article/content/${articleId}?typeCode=content`;
-    const detailUrl = `https://h5-api.lynkco.com${detailPath}`;
+    const detailUrl = `${H5_API_HOST}${detailPath}`;
 
     log("Detail request articleId = " + articleId);
     log("Request article detail: " + detailUrl);
@@ -686,14 +803,14 @@ async function runCron() {
     const detailRet = await request(
       "GET",
       detailUrl,
-      buildSignedHeaders("GET", detailPath)
+      buildH5SignedHeaders("GET", detailPath)
     );
 
     log("Article detail HTTP = " + detailRet.resp.status);
     log("Article detail body = " + String(detailRet.data || "").slice(0, 300));
 
     const readPath = `/app/explore/home-page/article/countingservice/add?itemId=${articleId}&types=ReadCount`;
-    const readUrl = `https://h5-api.lynkco.com${readPath}`;
+    const readUrl = `${H5_API_HOST}${readPath}`;
 
     log("ReadCount request itemId = " + articleId);
     log("Request ReadCount: " + readUrl);
@@ -701,7 +818,7 @@ async function runCron() {
     const readRet = await request(
       "POST",
       readUrl,
-      buildSignedHeaders("POST", readPath),
+      buildH5SignedHeaders("POST", readPath),
       {}
     );
 
@@ -709,7 +826,7 @@ async function runCron() {
     log("ReadCount body = " + String(readRet.data || "").slice(0, 300));
 
     const shareCountPath = `/app/explore/home-page/article/countingservice/add?itemId=${articleId}&types=ShareCount`;
-    const shareCountUrl = `https://h5-api.lynkco.com${shareCountPath}`;
+    const shareCountUrl = `${H5_API_HOST}${shareCountPath}`;
 
     log("ShareCount request itemId = " + articleId);
     log("Request ShareCount: " + shareCountUrl);
@@ -717,20 +834,22 @@ async function runCron() {
     const shareCountRet = await request(
       "POST",
       shareCountUrl,
-      buildSignedHeaders("POST", shareCountPath),
+      buildH5SignedHeaders("POST", shareCountPath),
       {}
     );
 
     log("ShareCount HTTP = " + shareCountRet.resp.status);
     log("ShareCount body = " + String(shareCountRet.data || "").slice(0, 300));
 
-    const reportUrl = `https://h5.lynkco.com/app/v1/task/shareReporting?shareCode=${encodeURIComponent(shareCode)}`;
+    const freshShareCode = await getNewShareCode(articleId);
+
+    const reportUrl = `${H5_HOST}/app/v1/task/shareReporting?shareCode=${encodeURIComponent(freshShareCode)}`;
 
     const reportHeaders = {
       "accept": "*/*",
       "content-type": "application/json",
-      "origin": "https://h5.lynkco.com",
-      "referer": "https://h5.lynkco.com/",
+      "origin": H5_HOST,
+      "referer": H5_HOST + "/",
       "accept-language": "zh-CN,zh-Hans;q=0.9",
       "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1"
     };
@@ -744,7 +863,7 @@ async function runCron() {
     };
 
     log("shareReporting businessNo = " + articleId);
-    log("shareReporting shareCode = " + mask(shareCode, 12, 8));
+    log("shareReporting shareCode = " + mask(freshShareCode, 12, 8));
     log("Request shareReporting: " + reportUrl);
     log("shareReporting request body = " + JSON.stringify(reportBody));
 
@@ -763,11 +882,30 @@ async function runCron() {
       reportObj = JSON.parse(reportRet.data || "{}");
     } catch (e) {}
 
-    if (reportObj.code === "success") {
+    const reportCode = reportObj.code || "";
+    const reportData = reportObj.data || "";
+    const reportMessage = reportObj.message || "";
+
+    log("shareReporting code = " + reportCode);
+    log("shareReporting data = " + reportData);
+    log("shareReporting message = " + reportMessage);
+
+    const reportSuccess =
+      Number(reportRet.resp.status) === 200 &&
+      reportCode === "success" &&
+      reportData === "上报成功";
+
+    if (reportSuccess) {
       saveUsedArticle(articleId);
       notify("LynkCo auto share done", articleId, title);
     } else {
-      notify("LynkCo auto share maybe failed", `HTTP ${reportRet.resp.status}`, String(reportRet.data || "").slice(0, 200));
+      log("shareReporting not completed, do not save used article id");
+
+      if (String(reportData).includes("验证码失效")) {
+        notify("LynkCo auto share failed", "shareCode expired", "getShareCode 可能未生成有效新码");
+      } else {
+        notify("LynkCo auto share failed", `HTTP ${reportRet.resp.status}`, String(reportRet.data || "").slice(0, 200));
+      }
     }
 
     log("LynkCo auto share end");

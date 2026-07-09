@@ -4,6 +4,10 @@
 #!homepage=https://github.com/swsv/network-toolkit
 
 [Script]
+http-request ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/refresh.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓RefreshRequest
+
+http-response ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/refresh.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓RefreshResponse
+
 http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓H5Token
 
 http-request ^https:\/\/app-services\.lynkco\.com\.cn\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓AppServicesRequest

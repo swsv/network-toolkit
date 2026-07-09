@@ -1,55 +1,73 @@
 /*
 领克每日自动分享脚本
-适用：Loon 3.3.9
+适用：Loon 3.3.9+
 
 功能说明：
 1. 自动抓取 token / svcsid。
-2. 点开文章分享面板时，自动抓取 getShareCode 响应里的当天 shareCode。
-3. 定时从探索页获取文章列表。
-4. 自动选择一篇未分享过的文章。
-5. 自动请求文章详情，相当于进入文章。
-6. 自动上报 ReadCount。
-7. 自动上报 ShareCount。
-8. 优先复用当天已捕获的 shareCode。
+2. 支持被动抓取 getShareCode 响应里的当天 shareCode。
+3. 支持 cron 运行时主动请求 /app/v1/task/getShareCode 获取 shareCode。
+4. 定时从探索页获取文章列表。
+5. 自动选择一篇未分享过的文章。
+6. 自动请求文章详情，相当于进入文章。
+7. 自动上报 ReadCount。
+8. 自动上报 ShareCount。
 9. 自动调用 shareReporting，完成 Co 积分分享任务。
 
-本地测试 Loon 配置：
+Loon 配置示例：
 
 [Script]
-# 必需：抓 token / svcsid、抓当天 shareCode、定时执行
+# 抓 token / svcsid
 http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=lynkco_auto_share.js, requires-body=false, timeout=30, tag=领克抓Token
+
+# 可选：被动抓 getShareCode 响应，作为兜底缓存
 http-response ^https:\/\/(app-services\.lynkco\.com\.cn|app-api-gw-toc\.lynkco\.com)\/app\/v1\/task\/getShareCode script-path=lynkco_auto_share.js, requires-body=true, timeout=30, tag=领克抓ShareCode
+
+# 定时执行
 cron "23 8,20 * * *" script-path=lynkco_auto_share.js, timeout=60, tag=领克每日自动分享
 
 [MITM]
 hostname = h5-api.lynkco.com, h5.lynkco.com, app-services.lynkco.com.cn, app-api-gw-toc.lynkco.com
 */
 
-const SCRIPT_VERSION = "2026-05-22-share-panel-code-cache-v13";
+const SCRIPT_VERSION = "2026-07-09-direct-getShareCode-v1";
 
+/* =========================
+ * Persistent Store Keys
+ * ========================= */
 const STORE_TOKEN = "lynkco_token";
 const STORE_SVCSID = "lynkco_svcsid";
 const STORE_USED_IDS = "lynkco_used_article_ids";
+
 const STORE_SHARE_CODE = "lynkco_share_code";
 const STORE_SHARE_CODE_DAY = "lynkco_share_code_day";
 const STORE_SHARE_CODE_SOURCE = "lynkco_share_code_source";
 const STORE_SHARE_CODE_ARTICLE_ID = "lynkco_share_code_article_id";
 const STORE_SHARE_URL = "lynkco_share_url";
 
+/* =========================
+ * Constants
+ * ========================= */
 const APP_CODE = "3fa3314998bd4195a9fe2df3e85e6a12";
 const APP_ID = "59701c08ed454a43a9b";
+
 const CA_KEY = "204644386";
 const CA_SECRET = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
 
 const H5_API_HOST = "https://h5-api.lynkco.com";
 const H5_HOST = "https://h5.lynkco.com";
+const APP_API_GW_HOST = "https://app-api-gw-toc.lynkco.com";
 
+const EP_GET_SHARE_CODE = "/app/v1/task/getShareCode";
+
+/* =========================
+ * Basic Utils
+ * ========================= */
 function log(msg) {
-  console.log(String(msg));
+  console.log("[LynkCo] " + String(msg));
 }
 
 function notify(title, sub, msg) {
-  log(`[Notify] ${title} | ${sub || ""} | ${msg || ""}`);
+  log("[Notify] " + title + " | " + (sub || "") + " | " + (msg || ""));
   try {
     $notification.post(title, sub || "", msg || "");
   } catch (e) {}
@@ -60,7 +78,7 @@ function read(key) {
 }
 
 function write(value, key) {
-  return $persistentStore.write(value, key);
+  return $persistentStore.write(String(value), key);
 }
 
 function mask(str, head, tail) {
@@ -115,6 +133,18 @@ function request(method, url, headers, body) {
   });
 }
 
+function parseJsonSafe(text) {
+  try {
+    return JSON.parse(text || "{}");
+  } catch (e) {
+    return {};
+  }
+}
+
+/* =========================
+ * HMAC SHA256 Implementation
+ * Loon 环境下不依赖 CryptoJS
+ * ========================= */
 function rightRotate(value, amount) {
   return (value >>> amount) | (value << (32 - amount));
 }
@@ -296,6 +326,9 @@ function hmacSha256Base64(message, key) {
   return base64(mac);
 }
 
+/* =========================
+ * Sign Headers
+ * ========================= */
 function canonicalizePathForSign(pathWithQuery) {
   if (!pathWithQuery.includes("?")) {
     return pathWithQuery;
@@ -373,8 +406,8 @@ function buildH5SignedHeaders(method, pathWithQuery) {
 
   const signature = hmacSha256Base64(stringToSign, CA_SECRET);
 
-  log(`Sign ${method.toUpperCase()} requestPath = ${pathWithQuery}`);
-  log(`Sign ${method.toUpperCase()} signPath = ${signPath}`);
+  log("Sign " + method.toUpperCase() + " requestPath = " + pathWithQuery);
+  log("Sign " + method.toUpperCase() + " signPath = " + signPath);
 
   return {
     "svcsid": svcsid || token || "",
@@ -399,6 +432,9 @@ function buildH5SignedHeaders(method, pathWithQuery) {
   };
 }
 
+/* =========================
+ * ShareCode Logic
+ * ========================= */
 function isGetShareCodeUrl(url) {
   const text = String(url || "");
   return (
@@ -500,6 +536,59 @@ function getTodayShareCode() {
   return "";
 }
 
+async function fetchShareCodeDirect() {
+  const token = read(STORE_TOKEN);
+  const svcsid = read(STORE_SVCSID);
+
+  if (!token && !svcsid) {
+    log("fetchShareCodeDirect failed: empty token/svcsid");
+    return "";
+  }
+
+  const path = EP_GET_SHARE_CODE;
+  const url = APP_API_GW_HOST + path;
+
+  log("Request direct getShareCode: " + url);
+
+  try {
+    const ret = await request(
+      "GET",
+      url,
+      buildH5SignedHeaders("GET", path)
+    );
+
+    log("Direct getShareCode HTTP = " + ret.resp.status);
+    log("Direct getShareCode body = " + String(ret.data || "").slice(0, 1000));
+
+    if (Number(ret.resp.status) !== 200) {
+      log("Direct getShareCode failed: HTTP " + ret.resp.status);
+      return "";
+    }
+
+    const obj = parseJsonSafe(ret.data);
+    const code = String(obj.code || "");
+    const shareCode = extractShareCode(obj);
+
+    log("Direct getShareCode code = " + code);
+    log("Direct getShareCode shareCode = " + mask(shareCode, 12, 8));
+
+    if (!shareCode) {
+      return "";
+    }
+
+    saveShareCode(shareCode, "direct-api", "");
+    notify("LynkCo shareCode direct OK", formatGmt8Day(Date.now()), mask(shareCode, 12, 8));
+
+    return shareCode;
+  } catch (e) {
+    log("fetchShareCodeDirect error = " + e);
+    return "";
+  }
+}
+
+/* =========================
+ * Stored State
+ * ========================= */
 function logStoredState() {
   const token = read(STORE_TOKEN);
   const svcsid = read(STORE_SVCSID);
@@ -520,6 +609,9 @@ function logStoredState() {
   log("Stored used ids = " + usedRaw);
 }
 
+/* =========================
+ * Loon HTTP Request Handler
+ * ========================= */
 function handleHttpRequest() {
   const url = $request.url || "";
   const headers = $request.headers || {};
@@ -547,6 +639,10 @@ function handleHttpRequest() {
   $done({});
 }
 
+/* =========================
+ * Loon HTTP Response Handler
+ * 被动抓 getShareCode
+ * ========================= */
 function handleHttpResponse() {
   const url = ($request && $request.url) || "";
   const headers = ($request && $request.headers) || {};
@@ -575,13 +671,7 @@ function handleHttpResponse() {
 
   log("getShareCode response body = " + String(body || "").slice(0, 1200));
 
-  let obj = {};
-  try {
-    obj = JSON.parse(body || "{}");
-  } catch (e) {
-    log("getShareCode response JSON parse failed = " + e);
-  }
-
+  const obj = parseJsonSafe(body);
   const shareCode = extractShareCode(obj);
   const articleId = extractArticleIdFromRiskRequestInfo(headers);
 
@@ -595,6 +685,9 @@ function handleHttpResponse() {
   $done({});
 }
 
+/* =========================
+ * Article Helpers
+ * ========================= */
 function extractArticleList(obj) {
   const candidates = [
     obj && obj.data && obj.data.list,
@@ -636,17 +729,17 @@ function getTitle(item) {
 }
 
 function getArticleDebugInfo(item, index) {
-  if (!item) return `#${index}: empty`;
+  if (!item) return "#" + index + ": empty";
 
   return [
-    `#${index}`,
-    `id=${item.id || ""}`,
-    `newId=${item.newId || ""}`,
-    `itemId=${item.itemId || ""}`,
-    `contentId=${item.contentId || ""}`,
-    `articleId=${item.articleId || ""}`,
-    `businessNo=${item.businessNo || ""}`,
-    `title=${getTitle(item)}`
+    "#" + index,
+    "id=" + (item.id || ""),
+    "newId=" + (item.newId || ""),
+    "itemId=" + (item.itemId || ""),
+    "contentId=" + (item.contentId || ""),
+    "articleId=" + (item.articleId || ""),
+    "businessNo=" + (item.businessNo || ""),
+    "title=" + getTitle(item)
   ].join(" | ");
 }
 
@@ -716,6 +809,9 @@ function saveUsedArticle(id) {
   log("Updated used article ids = " + JSON.stringify(used));
 }
 
+/* =========================
+ * Cron Main Logic
+ * ========================= */
 async function runCron() {
   log("LynkCo auto share start");
   log("SCRIPT_VERSION = " + SCRIPT_VERSION);
@@ -723,11 +819,9 @@ async function runCron() {
 
   const token = read(STORE_TOKEN);
   const svcsid = read(STORE_SVCSID);
-  const cachedShareCode = getTodayShareCode();
 
   log("token = " + (token ? "yes" : "empty"));
   log("svcsid = " + (svcsid ? "yes" : "empty"));
-  log("today shareCode = " + (cachedShareCode ? "yes" : "empty"));
 
   if (!token && !svcsid) {
     notify("LynkCo auto share failed", "Missing token", "打开领克 App 探索文章一次");
@@ -735,15 +829,22 @@ async function runCron() {
     return;
   }
 
-  if (!cachedShareCode) {
-    notify("LynkCo auto share failed", "Missing today's shareCode", "打开领克 App 文章页点分享一次");
+  let shareCode = getTodayShareCode();
+
+  if (!shareCode) {
+    log("No cached shareCode today, try direct getShareCode API");
+    shareCode = await fetchShareCodeDirect();
+  }
+
+  if (!shareCode) {
+    notify("LynkCo auto share failed", "Missing shareCode", "主动 getShareCode 失败，请查看 Loon 日志");
     $done({});
     return;
   }
 
   try {
-    const listPath = `/app/explore/home-page/v2/page/pull?pageNo=1&pageSize=10&articleTypes=`;
-    const listUrl = `${H5_API_HOST}${listPath}`;
+    const listPath = "/app/explore/home-page/v2/page/pull?pageNo=1&pageSize=10&articleTypes=";
+    const listUrl = H5_API_HOST + listPath;
 
     log("Request article list: " + listUrl);
 
@@ -754,7 +855,7 @@ async function runCron() {
     );
 
     log("Article list HTTP = " + listRet.resp.status);
-    log("Article list body = " + String(listRet.data || "").slice(0, 800));
+    log("Article list body = " + String(listRet.data || "").slice(0, 1000));
 
     if (Number(listRet.resp.status) !== 200) {
       notify("LynkCo auto share failed", "Article list HTTP " + listRet.resp.status, String(listRet.data || "{}").slice(0, 150));
@@ -762,7 +863,7 @@ async function runCron() {
       return;
     }
 
-    const listObj = JSON.parse(listRet.data || "{}");
+    const listObj = parseJsonSafe(listRet.data);
     const list = extractArticleList(listObj);
 
     log("Article list code = " + (listObj.code || ""));
@@ -795,20 +896,14 @@ async function runCron() {
       return;
     }
 
-    log("Selected article raw = " + JSON.stringify(article).slice(0, 800));
+    log("Selected article raw = " + JSON.stringify(article).slice(0, 1000));
     log("Selected article id = " + articleId);
-    log("Selected article newId = " + (article.newId || ""));
-    log("Selected article itemId = " + (article.itemId || ""));
-    log("Selected article contentId = " + (article.contentId || ""));
-    log("Selected article articleId = " + (article.articleId || ""));
-    log("Selected article businessNo = " + (article.businessNo || ""));
     log("Selected article title = " + title);
     log("Selected article shareUrl base = " + buildShareUrl(articleId));
 
-    const detailPath = `/app/explore/home-page/article/content/${articleId}?typeCode=content`;
-    const detailUrl = `${H5_API_HOST}${detailPath}`;
+    const detailPath = "/app/explore/home-page/article/content/" + articleId + "?typeCode=content";
+    const detailUrl = H5_API_HOST + detailPath;
 
-    log("Detail request articleId = " + articleId);
     log("Request article detail: " + detailUrl);
 
     const detailRet = await request(
@@ -818,12 +913,11 @@ async function runCron() {
     );
 
     log("Article detail HTTP = " + detailRet.resp.status);
-    log("Article detail body = " + String(detailRet.data || "").slice(0, 300));
+    log("Article detail body = " + String(detailRet.data || "").slice(0, 500));
 
-    const readPath = `/app/explore/home-page/article/countingservice/add?itemId=${articleId}&types=ReadCount`;
-    const readUrl = `${H5_API_HOST}${readPath}`;
+    const readPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ReadCount";
+    const readUrl = H5_API_HOST + readPath;
 
-    log("ReadCount request itemId = " + articleId);
     log("Request ReadCount: " + readUrl);
 
     const readRet = await request(
@@ -834,12 +928,11 @@ async function runCron() {
     );
 
     log("ReadCount HTTP = " + readRet.resp.status);
-    log("ReadCount body = " + String(readRet.data || "").slice(0, 300));
+    log("ReadCount body = " + String(readRet.data || "").slice(0, 500));
 
-    const shareCountPath = `/app/explore/home-page/article/countingservice/add?itemId=${articleId}&types=ShareCount`;
-    const shareCountUrl = `${H5_API_HOST}${shareCountPath}`;
+    const shareCountPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ShareCount";
+    const shareCountUrl = H5_API_HOST + shareCountPath;
 
-    log("ShareCount request itemId = " + articleId);
     log("Request ShareCount: " + shareCountUrl);
 
     const shareCountRet = await request(
@@ -850,15 +943,14 @@ async function runCron() {
     );
 
     log("ShareCount HTTP = " + shareCountRet.resp.status);
-    log("ShareCount body = " + String(shareCountRet.data || "").slice(0, 300));
+    log("ShareCount body = " + String(shareCountRet.data || "").slice(0, 500));
 
-    const freshShareCode = cachedShareCode;
-    const fullShareUrl = buildShareUrlWithCode(articleId, freshShareCode);
+    const fullShareUrl = buildShareUrlWithCode(articleId, shareCode);
     write(fullShareUrl, STORE_SHARE_URL);
 
     log("Selected article shareUrl with code = " + fullShareUrl);
 
-    const reportUrl = `${H5_HOST}/app/v1/task/shareReporting?shareCode=${encodeURIComponent(freshShareCode)}`;
+    const reportUrl = H5_HOST + "/app/v1/task/shareReporting?shareCode=" + encodeURIComponent(shareCode);
 
     const reportHeaders = {
       "accept": "*/*",
@@ -878,7 +970,7 @@ async function runCron() {
     };
 
     log("shareReporting businessNo = " + articleId);
-    log("shareReporting shareCode = " + mask(freshShareCode, 12, 8));
+    log("shareReporting shareCode = " + mask(shareCode, 12, 8));
     log("Request shareReporting: " + reportUrl);
     log("shareReporting request body = " + JSON.stringify(reportBody));
 
@@ -890,12 +982,9 @@ async function runCron() {
     );
 
     log("shareReporting HTTP = " + reportRet.resp.status);
-    log("shareReporting body = " + String(reportRet.data || "").slice(0, 500));
+    log("shareReporting body = " + String(reportRet.data || "").slice(0, 800));
 
-    let reportObj = {};
-    try {
-      reportObj = JSON.parse(reportRet.data || "{}");
-    } catch (e) {}
+    const reportObj = parseJsonSafe(reportRet.data);
 
     const reportCode = reportObj.code || "";
     const reportData = reportObj.data || "";
@@ -908,7 +997,7 @@ async function runCron() {
     const reportSuccess =
       Number(reportRet.resp.status) === 200 &&
       reportCode === "success" &&
-      reportData === "上报成功";
+      String(reportData).includes("上报成功");
 
     if (reportSuccess) {
       saveUsedArticle(articleId);
@@ -917,9 +1006,9 @@ async function runCron() {
       log("shareReporting not completed, do not save used article id");
 
       if (String(reportData).includes("验证码失效")) {
-        notify("LynkCo auto share failed", "shareCode expired", "打开领克 App 文章页重新点分享一次");
+        notify("LynkCo auto share failed", "shareCode expired", "脚本会下次重新 getShareCode，也可手动点分享刷新");
       } else {
-        notify("LynkCo auto share failed", `HTTP ${reportRet.resp.status}`, String(reportRet.data || "").slice(0, 200));
+        notify("LynkCo auto share failed", "HTTP " + reportRet.resp.status, String(reportRet.data || "").slice(0, 200));
       }
     }
 
@@ -932,6 +1021,9 @@ async function runCron() {
   }
 }
 
+/* =========================
+ * Entry
+ * ========================= */
 if (typeof $response !== "undefined" && typeof $request !== "undefined") {
   handleHttpResponse();
 } else if (typeof $request !== "undefined") {

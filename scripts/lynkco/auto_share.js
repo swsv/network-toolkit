@@ -2,36 +2,16 @@
 领克每日签到 + 自动分享脚本
 适用：Loon 3.5.0+
 
-核心思路：
-1. 参考 sy5t4w-del/lynk_auto_sign：
-   - refreshToken + deviceId -> accessToken
-   - /up/api/v1/user/sign 签到
-   - /app/v1/task/getShareCode 主动获取 shareCode
-2. 合并当前 Loon 抓包能力：
-   - 自动抓 token / svcsid
-   - 自动抓 refreshToken / deviceId
-   - 兼容旧 H5 分享任务链路
+核心逻辑：
+1. Loon 抓包保存 refreshToken / deviceId / H5 token。
+2. Cron 执行时先用 refreshToken + deviceId 调 /auth/login/refresh。
+3. 使用返回的 centerTokenDto.token 调签到、签到信息、任务列表、getShareCode。
+4. 文章列表 / ReadCount / ShareCount / shareReporting 沿用 H5 链路。
 
-Loon 插件建议：
-
-[Script]
-# 抓 H5 token / svcsid
-http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓Token
-
-# 抓登录/刷新响应里的 refreshToken，可选但建议保留
-http-response ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓RefreshToken
-
-# 可选：被动抓 getShareCode，作为兜底
-http-response ^https:\/\/(app-services\.lynkco\.com\.cn|app-api-gw-toc\.lynkco\.com)\/app\/v1\/task\/getShareCode script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓ShareCode
-
-# 定时执行
-cron "23 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=90, tag=领克每日签到分享
-
-[MITM]
-hostname = h5-api.lynkco.com, h5.lynkco.com, app-services.lynkco.com.cn, app-api-gw-toc.lynkco.com
+建议 Loon 插件配置见本文末尾。
 */
 
-const SCRIPT_VERSION = "2026-07-09-loon-merged-sign-share-v1";
+const SCRIPT_VERSION = "2026-07-09-loon-refresh-sign-share-v2";
 
 /* =========================
  * Store Keys
@@ -66,11 +46,9 @@ const APP_API_GW_HOST = "https://app-api-gw-toc.lynkco.com";
 const OAUTH_HOST = "https://app-services.lynkco.com.cn";
 
 const EP_REFRESH = "/auth/login/refresh";
-
 const EP_DAILY_SIGN = "/up/api/v1/user/sign";
 const EP_SIGN_INFO = "/up/api/v1/userReward/getContinueDaysAndSignCard";
 const EP_TASK_LIST = "/up/api/v1/userReward/getTaskList";
-const EP_ENERGY = "/app/energy/myEnergy";
 const EP_GET_SHARE_CODE = "/app/v1/task/getShareCode";
 
 /* =========================
@@ -137,7 +115,7 @@ function request(method, url, headers, body) {
       opts.body = typeof body === "string" ? body : JSON.stringify(body);
     }
 
-    const callback = function (error, response, data) {
+    const cb = function (error, response, data) {
       if (error) {
         reject(error);
       } else {
@@ -149,9 +127,9 @@ function request(method, url, headers, body) {
     };
 
     if (method.toUpperCase() === "GET") {
-      $httpClient.get(opts, callback);
+      $httpClient.get(opts, cb);
     } else {
-      $httpClient.post(opts, callback);
+      $httpClient.post(opts, cb);
     }
   });
 }
@@ -169,77 +147,78 @@ function formatGmt8Day(now) {
   );
 }
 
-/* =========================
- * URL Utils
- * ========================= */
 function parseUrlQuery(url) {
   const out = {};
   const text = String(url || "");
   const idx = text.indexOf("?");
   if (idx < 0) return out;
 
-  const q = text.slice(idx + 1);
-  q.split("&").forEach(pair => {
+  text.slice(idx + 1).split("&").forEach(pair => {
     if (!pair) return;
     const eq = pair.indexOf("=");
     if (eq < 0) {
       out[decodeURIComponent(pair)] = "";
     } else {
-      const k = decodeURIComponent(pair.slice(0, eq));
-      const v = decodeURIComponent(pair.slice(eq + 1));
-      out[k] = v;
+      out[decodeURIComponent(pair.slice(0, eq))] = decodeURIComponent(pair.slice(eq + 1));
     }
   });
 
   return out;
 }
 
-function extractDeviceIdFromUrl(url) {
+/* =========================
+ * Deep Extract
+ * ========================= */
+function deepFindKey(obj, keyNames) {
+  if (!obj || typeof obj !== "object") return "";
+
+  const lowerNames = keyNames.map(k => k.toLowerCase());
+
+  for (const k of Object.keys(obj)) {
+    if (lowerNames.includes(k.toLowerCase())) {
+      const v = obj[k];
+      if (typeof v === "string" && v) return v;
+    }
+  }
+
+  for (const k of Object.keys(obj)) {
+    const v = obj[k];
+    if (v && typeof v === "object") {
+      const found = deepFindKey(v, keyNames);
+      if (found) return found;
+    }
+  }
+
+  return "";
+}
+
+function extractRefreshTokenFromBody(obj) {
+  return deepFindKey(obj, ["refreshToken", "refresh_token"]);
+}
+
+function extractAccessTokenFromBody(obj) {
+  const dto = obj && obj.data && obj.data.centerTokenDto;
+  if (dto && typeof dto.token === "string") return dto.token;
+
+  return deepFindKey(obj, ["accessToken", "access_token", "token"]);
+}
+
+function extractDeviceIdFromUrlOrHeaders(url, headers) {
   const q = parseUrlQuery(url);
-  return q.deviceId || q.deviceid || q.gl_dev_id || "";
-}
 
-function extractTokenFromObject(obj) {
-  if (!obj) return "";
-
-  const paths = [
-    obj.refreshToken,
-    obj.data && obj.data.refreshToken,
-    obj.data && obj.data.centerTokenDto && obj.data.centerTokenDto.refreshToken,
-    obj.centerTokenDto && obj.centerTokenDto.refreshToken,
-    obj.token && String(obj.token).includes("bearer") ? obj.token : "",
-    obj.data && obj.data.token && String(obj.data.token).includes("bearer") ? obj.data.token : ""
-  ];
-
-  for (const p of paths) {
-    if (p && typeof p === "string") return p;
-  }
-
-  return "";
-}
-
-function extractAccessTokenFromObject(obj) {
-  if (!obj) return "";
-
-  const paths = [
-    obj.accessToken,
-    obj.data && obj.data.accessToken,
-    obj.data && obj.data.centerTokenDto && obj.data.centerTokenDto.token,
-    obj.centerTokenDto && obj.centerTokenDto.token,
-    obj.token,
-    obj.data && obj.data.token
-  ];
-
-  for (const p of paths) {
-    if (p && typeof p === "string") return p;
-  }
-
-  return "";
+  return (
+    getHeader(headers, "gl_dev_id") ||
+    getHeader(headers, "deviceId") ||
+    getHeader(headers, "deviceid") ||
+    q.deviceId ||
+    q.deviceid ||
+    q.gl_dev_id ||
+    ""
+  );
 }
 
 /* =========================
  * SHA256 + HMAC
- * 不依赖 CryptoJS
  * ========================= */
 function rightRotate(value, amount) {
   return (value >>> amount) | (value << (32 - amount));
@@ -332,6 +311,7 @@ function sha256Bytes(inputBytes) {
       const S1 = rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25);
       const ch = (e & f) ^ ((~e) & g);
       const temp1 = (h + S1 + ch + K[j] + w[j]) | 0;
+
       const S0 = rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22);
       const maj = (a & b) ^ (a & c) ^ (b & c);
       const temp2 = (S0 + maj) | 0;
@@ -389,10 +369,7 @@ function base64(bytes) {
 function hmacSha256Base64(message, key) {
   let keyBytes = utf8Bytes(key);
 
-  if (keyBytes.length > 64) {
-    keyBytes = sha256Bytes(keyBytes);
-  }
-
+  if (keyBytes.length > 64) keyBytes = sha256Bytes(keyBytes);
   while (keyBytes.length < 64) keyBytes.push(0);
 
   const oKey = [];
@@ -409,8 +386,7 @@ function hmacSha256Base64(message, key) {
 }
 
 /* =========================
- * API Gateway Signature
- * 按 lynk_auto_sign 风格
+ * Signature
  * ========================= */
 function canonicalizePathForSign(pathWithQuery) {
   if (!pathWithQuery.includes("?")) return pathWithQuery;
@@ -453,14 +429,18 @@ function canonicalizePathForSign(pathWithQuery) {
   return path + "?" + canonicalQuery;
 }
 
-function buildApiSignedHeaders(method, pathWithQuery, token) {
+function buildSignedHeaders(method, pathWithQuery, token) {
   const timestamp = String(Date.now());
-  const nonce = uuid().toUpperCase();
+  const nonce = uuid();
 
   const accept = "*/*";
   const contentType = "application/json";
   const signPath = canonicalizePathForSign(pathWithQuery);
 
+  /*
+   * 注意：
+   * 这里沿用你当前 Loon 脚本已经验证能跑通的签名串顺序。
+   */
   const stringToSign = [
     method.toUpperCase(),
     accept,
@@ -480,6 +460,7 @@ function buildApiSignedHeaders(method, pathWithQuery, token) {
 
   return {
     "token": token || "",
+    "svcsid": token || "",
     "content-type": contentType,
     "accept": accept,
     "x-ca-key": CA_KEY,
@@ -492,69 +473,25 @@ function buildApiSignedHeaders(method, pathWithQuery, token) {
     "authentication": `AppId=${APP_ID}`,
     "origin": H5_HOST,
     "referer": H5_HOST + "/",
-    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/4.2.0 appVersionName/40200106",
-    "acl-app": "BUYER"
-  };
-}
-
-function buildH5SignedHeaders(method, pathWithQuery, tokenOverride) {
-  const token = tokenOverride || read(STORE_TOKEN) || read(STORE_ACCESS_TOKEN) || "";
-  const svcsid = read(STORE_SVCSID) || token;
-
-  const timestamp = String(Date.now());
-  const nonce = uuid();
-
-  const accept = "*/*";
-  const contentType = "application/json";
-  const signPath = canonicalizePathForSign(pathWithQuery);
-
-  const stringToSign = [
-    method.toUpperCase(),
-    accept,
-    "",
-    contentType,
-    "",
-    `X-Ca-Key:${CA_KEY}`,
-    `X-Ca-Nonce:${nonce}`,
-    "X-Ca-Signature-Method:HmacSHA256",
-    `X-Ca-Timestamp:${timestamp}`,
-    signPath
-  ].join("\n");
-
-  const signature = hmacSha256Base64(stringToSign, CA_SECRET);
-
-  return {
-    "svcsid": svcsid || token || "",
-    "origin": H5_HOST,
-    "x-ca-signature-headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
-    "x-ca-key": CA_KEY,
-    "appversioncode": "4.2.0",
-    "token": token || "",
-    "x-ca-nonce": nonce,
-    "content-type": contentType,
-    "authentication": `AppId=${APP_ID}`,
-    "accept": accept,
-    "authorization": `APPCODE ${APP_CODE}`,
-    "appversionname": "40200106",
-    "x-ca-signature": signature,
-    "referer": H5_HOST + "/",
     "accept-language": "zh-CN,zh-Hans;q=0.9",
-    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/4.2.0 appVersionName/40200106",
     "acl-app": "BUYER",
-    "x-ca-timestamp": timestamp,
-    "x-ca-signature-method": "HmacSHA256"
+    "appversioncode": "4.2.0",
+    "appversionname": "40200106",
+    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/4.2.0 appVersionName/40200106"
   };
 }
 
 /* =========================
- * Token Refresh
+ * RefreshToken -> AccessToken
+ * Python 方式核心实现
  * ========================= */
-async function refreshAccessToken() {
+async function refreshAccessTokenStrict() {
   const refreshToken = read(STORE_REFRESH_TOKEN);
   const deviceId = read(STORE_DEVICE_ID);
 
   if (!refreshToken || !deviceId) {
-    log("refreshAccessToken skipped: missing refreshToken/deviceId");
+    log("refreshAccessTokenStrict failed: missing refreshToken/deviceId");
+    notify("领克凭证缺失", "缺少 refreshToken/deviceId", "请退出领克 App 后重新登录，让 Loon 抓 auth/login 响应");
     return "";
   }
 
@@ -587,66 +524,63 @@ async function refreshAccessToken() {
 
   try {
     const ret = await request("GET", url, headers);
+
     log("Refresh HTTP = " + ret.resp.status);
-    log("Refresh body = " + String(ret.data || "").slice(0, 1000));
+    log("Refresh body = " + String(ret.data || "").slice(0, 1200));
 
     if (Number(ret.resp.status) !== 200) return "";
 
     const obj = parseJsonSafe(ret.data);
-    if (String(obj.code || "") !== "success") return "";
+
+    if (String(obj.code || "") !== "success") {
+      log("Refresh failed code = " + String(obj.code || ""));
+      return "";
+    }
 
     const dto = (obj.data && obj.data.centerTokenDto) || {};
     const accessToken = dto.token || "";
     const newRefreshToken = dto.refreshToken || "";
 
-    if (accessToken) {
-      write(accessToken, STORE_ACCESS_TOKEN);
-      write(accessToken, STORE_TOKEN);
-      write(accessToken, STORE_SVCSID);
-      write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
-      log("accessToken saved = " + mask(accessToken, 12, 8));
+    if (!accessToken) {
+      log("Refresh success but accessToken empty");
+      return "";
     }
 
-    if (newRefreshToken && newRefreshToken !== refreshToken) {
+    write(accessToken, STORE_ACCESS_TOKEN);
+    write(accessToken, STORE_TOKEN);
+    write(accessToken, STORE_SVCSID);
+    write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
+
+    if (newRefreshToken) {
       write(newRefreshToken, STORE_REFRESH_TOKEN);
       log("refreshToken updated = " + mask(newRefreshToken, 12, 8));
     }
 
+    log("accessToken saved = " + mask(accessToken, 12, 8));
     return accessToken;
   } catch (e) {
-    log("refreshAccessToken error = " + e);
+    log("refreshAccessTokenStrict error = " + e);
     return "";
   }
 }
 
-async function getBusinessToken() {
-  let token = "";
-
-  token = await refreshAccessToken();
-
-  if (token) return token;
-
-  token = read(STORE_ACCESS_TOKEN) || read(STORE_TOKEN) || read(STORE_SVCSID) || "";
-
-  if (token) {
-    log("Use fallback token = " + mask(token, 12, 8));
-  }
-
-  return token;
-}
-
 /* =========================
- * API Business Calls
+ * API Calls
  * ========================= */
 async function apiCall(method, pathWithQuery, token, body) {
   const url = APP_API_GW_HOST + pathWithQuery;
-  const headers = buildApiSignedHeaders(method, pathWithQuery, token);
 
   log("API request " + method + " " + url);
 
-  const ret = await request(method, url, headers, body);
+  const ret = await request(
+    method,
+    url,
+    buildSignedHeaders(method, pathWithQuery, token),
+    body
+  );
+
   log("API HTTP = " + ret.resp.status);
-  log("API body = " + String(ret.data || "").slice(0, 1000));
+  log("API body = " + String(ret.data || "").slice(0, 1200));
 
   return {
     status: Number(ret.resp.status),
@@ -660,24 +594,24 @@ async function doDailySign(token) {
 
   const ret = await apiCall("POST", EP_DAILY_SIGN, token, {});
   const obj = ret.obj || {};
-  const allText = JSON.stringify(obj);
+  const text = JSON.stringify(obj);
 
   if (ret.status === 200 && String(obj.code || "") === "success") {
-    notify("领克签到完成", "", obj.message || allText.slice(0, 120));
+    notify("领克签到完成", "", obj.message || text.slice(0, 120));
     return true;
   }
 
   if (
-    allText.includes("已签到") ||
-    allText.includes("已经签到") ||
-    allText.includes("今日已") ||
-    allText.includes("重复")
+    text.includes("已签到") ||
+    text.includes("已经签到") ||
+    text.includes("今日已") ||
+    text.includes("重复")
   ) {
-    notify("领克今日已签到", "", obj.message || allText.slice(0, 120));
+    notify("领克今日已签到", "", obj.message || text.slice(0, 120));
     return true;
   }
 
-  notify("领克签到失败", "HTTP " + ret.status, allText.slice(0, 200));
+  notify("领克签到失败", "HTTP " + ret.status, text.slice(0, 200));
   return false;
 }
 
@@ -690,27 +624,11 @@ async function getSignInfo(token) {
   if (ret.status !== 200 || String(obj.code || "") !== "success") return;
 
   const data = obj.data || {};
-  const days =
-    data.continueDays ||
-    data.continuousDays ||
-    data.signDays ||
-    "";
-
-  const cards =
-    data.signCardNumber ||
-    data.signCardNum ||
-    "";
+  const days = data.continueDays || data.continuousDays || data.signDays || "";
+  const cards = data.signCardNumber || data.signCardNum || "";
 
   log("Sign continue days = " + days);
   log("Sign card number = " + cards);
-
-  if (days !== "" || cards !== "") {
-    notify(
-      "领克签到信息",
-      days !== "" ? "连续签到 " + days + " 天" : "",
-      cards !== "" ? "补签卡 " + cards + " 张" : ""
-    );
-  }
 }
 
 async function getTaskList(token) {
@@ -719,9 +637,9 @@ async function getTaskList(token) {
   const ret = await apiCall("GET", EP_TASK_LIST, token);
   const obj = ret.obj || {};
 
-  if (ret.status !== 200 || String(obj.code || "") !== "success") return;
-
-  log("Task list body parsed OK");
+  if (ret.status === 200 && String(obj.code || "") === "success") {
+    log("Task list OK");
+  }
 }
 
 function extractShareCode(obj) {
@@ -733,6 +651,25 @@ function extractShareCode(obj) {
   return "";
 }
 
+async function fetchShareCodeDirect(token) {
+  log("Direct getShareCode start");
+
+  const ret = await apiCall("GET", EP_GET_SHARE_CODE, token);
+  const shareCode = extractShareCode(ret.obj);
+
+  if (ret.status === 200 && shareCode) {
+    saveShareCode(shareCode, "direct-api", "");
+    notify("领克 shareCode 获取成功", formatGmt8Day(Date.now()), mask(shareCode, 12, 8));
+    return shareCode;
+  }
+
+  notify("领克 shareCode 获取失败", "HTTP " + ret.status, String(ret.raw || "").slice(0, 200));
+  return "";
+}
+
+/* =========================
+ * ShareCode / Article Utils
+ * ========================= */
 function buildShareUrl(articleId) {
   const routeUrl = `/pages/exploration/article/index.js?id=${articleId}`;
   return (
@@ -767,42 +704,6 @@ function saveShareCode(shareCode, source, articleId) {
   log("shareCode articleId = " + (articleId || ""));
 }
 
-function getTodayShareCode() {
-  const shareCode = read(STORE_SHARE_CODE);
-  const shareCodeDay = read(STORE_SHARE_CODE_DAY);
-  const today = formatGmt8Day(Date.now());
-
-  if (shareCode && shareCodeDay === today) {
-    log("Use cached shareCode for today = " + mask(shareCode, 12, 8));
-    return shareCode;
-  }
-
-  return "";
-}
-
-async function fetchShareCodeDirect(token) {
-  let cached = getTodayShareCode();
-  if (cached) return cached;
-
-  log("Direct getShareCode start");
-
-  const ret = await apiCall("GET", EP_GET_SHARE_CODE, token);
-  const shareCode = extractShareCode(ret.obj);
-
-  if (ret.status === 200 && shareCode) {
-    saveShareCode(shareCode, "direct-api", "");
-    notify("领克 shareCode 获取成功", formatGmt8Day(Date.now()), mask(shareCode, 12, 8));
-    return shareCode;
-  }
-
-  notify("领克 shareCode 获取失败", "HTTP " + ret.status, String(ret.raw || "").slice(0, 200));
-  return "";
-}
-
-/* =========================
- * Article Share Logic
- * 保留你当前 Loon 脚本跑通的 H5 链路
- * ========================= */
 function extractArticleList(obj) {
   const candidates = [
     obj && obj.data && obj.data.list,
@@ -904,7 +805,7 @@ function saveUsedArticle(id) {
   log("Saved used article id = " + id);
 }
 
-async function doArticleShare(accessToken, shareCode) {
+async function doArticleShare(token, shareCode) {
   log("Article share start");
 
   const listPath = "/app/explore/home-page/v2/page/pull?pageNo=1&pageSize=10&articleTypes=";
@@ -915,7 +816,7 @@ async function doArticleShare(accessToken, shareCode) {
   const listRet = await request(
     "GET",
     listUrl,
-    buildH5SignedHeaders("GET", listPath, accessToken)
+    buildSignedHeaders("GET", listPath, token)
   );
 
   log("Article list HTTP = " + listRet.resp.status);
@@ -942,6 +843,7 @@ async function doArticleShare(accessToken, shareCode) {
   }
 
   const article = pickArticle(list);
+
   if (!article) {
     notify("领克分享失败", "没有可用文章", "");
     return false;
@@ -959,22 +861,22 @@ async function doArticleShare(accessToken, shareCode) {
   log("Selected article title = " + title);
 
   const detailPath = "/app/explore/home-page/article/content/" + articleId + "?typeCode=content";
-  const detailUrl = H5_API_HOST + detailPath;
 
   const detailRet = await request(
     "GET",
-    detailUrl,
-    buildH5SignedHeaders("GET", detailPath, accessToken)
+    H5_API_HOST + detailPath,
+    buildSignedHeaders("GET", detailPath, token)
   );
 
   log("Article detail HTTP = " + detailRet.resp.status);
   log("Article detail body = " + String(detailRet.data || "").slice(0, 500));
 
   const readPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ReadCount";
+
   const readRet = await request(
     "POST",
     H5_API_HOST + readPath,
-    buildH5SignedHeaders("POST", readPath, accessToken),
+    buildSignedHeaders("POST", readPath, token),
     {}
   );
 
@@ -982,10 +884,11 @@ async function doArticleShare(accessToken, shareCode) {
   log("ReadCount body = " + String(readRet.data || "").slice(0, 500));
 
   const shareCountPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ShareCount";
+
   const shareCountRet = await request(
     "POST",
     H5_API_HOST + shareCountPath,
-    buildH5SignedHeaders("POST", shareCountPath, accessToken),
+    buildSignedHeaders("POST", shareCountPath, token),
     {}
   );
 
@@ -1075,16 +978,22 @@ function extractArticleIdFromRiskRequestInfo(headers) {
 function handleHttpRequest() {
   const url = $request.url || "";
   const headers = $request.headers || {};
+  const query = parseUrlQuery(url);
 
   log("HTTP_REQUEST URL = " + url);
   log("SCRIPT_VERSION = " + SCRIPT_VERSION);
 
   const token = getHeader(headers, "token");
   const svcsid = getHeader(headers, "svcsid");
-  const deviceId =
-    getHeader(headers, "gl_dev_id") ||
-    getHeader(headers, "deviceId") ||
-    extractDeviceIdFromUrl(url);
+
+  const deviceId = extractDeviceIdFromUrlOrHeaders(url, headers);
+
+  const refreshToken =
+    query.refreshToken ||
+    query.refreshtoken ||
+    getHeader(headers, "refreshToken") ||
+    getHeader(headers, "refreshtoken") ||
+    "";
 
   if (token) {
     write(token, STORE_TOKEN);
@@ -1101,8 +1010,13 @@ function handleHttpRequest() {
     log("deviceId saved = " + mask(deviceId, 8, 6));
   }
 
-  if (token || svcsid || deviceId) {
-    notify("领克抓包成功", "token/svcsid/deviceId", "已更新本地缓存");
+  if (refreshToken) {
+    write(refreshToken, STORE_REFRESH_TOKEN);
+    log("refreshToken saved from request = " + mask(refreshToken, 12, 8));
+  }
+
+  if (token || svcsid || deviceId || refreshToken) {
+    notify("领克抓包成功", "token/svcsid/refreshToken/deviceId", "已更新本地缓存");
   }
 
   $done({});
@@ -1112,29 +1026,27 @@ function handleHttpResponse() {
   const url = ($request && $request.url) || "";
   const reqHeaders = ($request && $request.headers) || {};
   const body = ($response && $response.body) || "";
+  const obj = parseJsonSafe(body);
 
   log("HTTP_RESPONSE URL = " + url);
   log("SCRIPT_VERSION = " + SCRIPT_VERSION);
 
-  const deviceId =
-    getHeader(reqHeaders, "gl_dev_id") ||
-    getHeader(reqHeaders, "deviceId") ||
-    extractDeviceIdFromUrl(url);
+  const deviceId = extractDeviceIdFromUrlOrHeaders(url, reqHeaders);
 
   if (deviceId) {
     write(deviceId, STORE_DEVICE_ID);
     log("deviceId saved from response request = " + mask(deviceId, 8, 6));
   }
 
-  const obj = parseJsonSafe(body);
+  if (url.includes("/auth/")) {
+    const refreshToken = extractRefreshTokenFromBody(obj);
+    const accessToken = extractAccessTokenFromBody(obj);
 
-  if (url.includes("/auth/login/")) {
-    const refreshToken = extractTokenFromObject(obj);
-    const accessToken = extractAccessTokenFromObject(obj);
+    log("auth response body = " + String(body || "").slice(0, 1200));
 
     if (refreshToken) {
       write(refreshToken, STORE_REFRESH_TOKEN);
-      log("refreshToken saved = " + mask(refreshToken, 12, 8));
+      log("refreshToken saved from auth response = " + mask(refreshToken, 12, 8));
     }
 
     if (accessToken) {
@@ -1142,7 +1054,7 @@ function handleHttpResponse() {
       write(accessToken, STORE_TOKEN);
       write(accessToken, STORE_SVCSID);
       write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
-      log("accessToken saved = " + mask(accessToken, 12, 8));
+      log("accessToken saved from auth response = " + mask(accessToken, 12, 8));
     }
 
     if (refreshToken || accessToken || deviceId) {
@@ -1208,25 +1120,30 @@ async function runCron() {
   logStoredState();
 
   try {
-    const token = await getBusinessToken();
+    /*
+     * 关键点：
+     * 这里必须严格按 Python 方式 refresh。
+     * 签到不再 fallback 使用 H5 token。
+     */
+    const accessToken = await refreshAccessTokenStrict();
 
-    if (!token) {
+    if (!accessToken) {
       notify(
         "领克任务失败",
-        "缺少 token",
-        "请打开领克 App 登录/探索页，让 Loon 抓 refreshToken/deviceId"
+        "refresh 失败",
+        "缺少 refreshToken/deviceId 或 refreshToken 已过期，请重新登录抓包"
       );
       $done({});
       return;
     }
 
-    log("Business token = " + mask(token, 12, 8));
+    log("Business accessToken = " + mask(accessToken, 12, 8));
 
-    await doDailySign(token);
-    await getSignInfo(token);
-    await getTaskList(token);
+    await doDailySign(accessToken);
+    await getSignInfo(accessToken);
+    await getTaskList(accessToken);
 
-    const shareCode = await fetchShareCodeDirect(token);
+    const shareCode = await fetchShareCodeDirect(accessToken);
 
     if (!shareCode) {
       notify("领克分享跳过", "shareCode 获取失败", "签到已尝试完成，请看日志");
@@ -1234,7 +1151,7 @@ async function runCron() {
       return;
     }
 
-    await doArticleShare(token, shareCode);
+    await doArticleShare(accessToken, shareCode);
 
     log("LynkCo sign + share end");
     $done({});

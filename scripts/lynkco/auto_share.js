@@ -2,16 +2,14 @@
 领克每日签到 + 自动分享脚本
 适用：Loon 3.5.0+
 
-核心逻辑：
-1. Loon 抓包保存 refreshToken / deviceId / H5 token。
-2. Cron 执行时先用 refreshToken + deviceId 调 /auth/login/refresh。
-3. 使用返回的 centerTokenDto.token 调签到、签到信息、任务列表、getShareCode。
-4. 文章列表 / ReadCount / ShareCount / shareReporting 沿用 H5 链路。
-
-建议 Loon 插件配置见本文末尾。
+功能：
+1. Loon 抓 /auth/login/refresh 保存 refreshToken / deviceId / gl_dev_id / accessToken。
+2. Cron 执行时先用 refreshToken + deviceId 刷新 accessToken。
+3. 使用 accessToken 执行签到、查询签到信息、查询任务列表、主动获取 shareCode。
+4. 自动获取探索文章，执行 ReadCount / ShareCount / shareReporting。
 */
 
-const SCRIPT_VERSION = "2026-07-09-loon-refresh-sign-share-v2";
+const SCRIPT_VERSION = "2026-07-09-loon-refresh-sign-share-final-v3";
 
 /* =========================
  * Store Keys
@@ -20,6 +18,7 @@ const STORE_TOKEN = "lynkco_token";
 const STORE_SVCSID = "lynkco_svcsid";
 const STORE_REFRESH_TOKEN = "lynkco_refresh_token";
 const STORE_DEVICE_ID = "lynkco_device_id";
+const STORE_GL_DEV_ID = "lynkco_gl_dev_id";
 const STORE_ACCESS_TOKEN = "lynkco_access_token";
 const STORE_ACCESS_TOKEN_DAY = "lynkco_access_token_day";
 
@@ -44,6 +43,9 @@ const H5_API_HOST = "https://h5-api.lynkco.com";
 const H5_HOST = "https://h5.lynkco.com";
 const APP_API_GW_HOST = "https://app-api-gw-toc.lynkco.com";
 const OAUTH_HOST = "https://app-services.lynkco.com.cn";
+
+const APP_VERSION = "4.2.3";
+const APP_BUILD = "40203073";
 
 const EP_REFRESH = "/auth/login/refresh";
 const EP_DAILY_SIGN = "/up/api/v1/user/sign";
@@ -166,6 +168,20 @@ function parseUrlQuery(url) {
   return out;
 }
 
+function isApiSuccess(ret) {
+  const obj = ret.obj || {};
+  const code = String(obj.code || "");
+
+  return (
+    ret.status === 200 &&
+    (
+      code === "success" ||
+      code === "200" ||
+      obj.success === true
+    )
+  );
+}
+
 /* =========================
  * Deep Extract
  * ========================= */
@@ -203,18 +219,28 @@ function extractAccessTokenFromBody(obj) {
   return deepFindKey(obj, ["accessToken", "access_token", "token"]);
 }
 
-function extractDeviceIdFromUrlOrHeaders(url, headers) {
+function extractDeviceInfoFromUrlOrHeaders(url, headers) {
   const q = parseUrlQuery(url);
 
-  return (
-    getHeader(headers, "gl_dev_id") ||
-    getHeader(headers, "deviceId") ||
-    getHeader(headers, "deviceid") ||
+  const queryDeviceId =
     q.deviceId ||
     q.deviceid ||
-    q.gl_dev_id ||
-    ""
-  );
+    "";
+
+  const glDevId =
+    getHeader(headers, "gl_dev_id") ||
+    getHeader(headers, "glDevId") ||
+    "";
+
+  const headerDeviceId =
+    getHeader(headers, "deviceId") ||
+    getHeader(headers, "deviceid") ||
+    "";
+
+  return {
+    deviceId: queryDeviceId || headerDeviceId || glDevId || "",
+    glDevId: glDevId || headerDeviceId || queryDeviceId || ""
+  };
 }
 
 /* =========================
@@ -437,10 +463,6 @@ function buildSignedHeaders(method, pathWithQuery, token) {
   const contentType = "application/json";
   const signPath = canonicalizePathForSign(pathWithQuery);
 
-  /*
-   * 注意：
-   * 这里沿用你当前 Loon 脚本已经验证能跑通的签名串顺序。
-   */
   const stringToSign = [
     method.toUpperCase(),
     accept,
@@ -475,23 +497,23 @@ function buildSignedHeaders(method, pathWithQuery, token) {
     "referer": H5_HOST + "/",
     "accept-language": "zh-CN,zh-Hans;q=0.9",
     "acl-app": "BUYER",
-    "appversioncode": "4.2.0",
-    "appversionname": "40200106",
-    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/4.2.0 appVersionName/40200106"
+    "appversioncode": APP_VERSION,
+    "appversionname": APP_BUILD,
+    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/" + APP_VERSION + " appVersionName/" + APP_BUILD
   };
 }
 
 /* =========================
  * RefreshToken -> AccessToken
- * Python 方式核心实现
  * ========================= */
 async function refreshAccessTokenStrict() {
   const refreshToken = read(STORE_REFRESH_TOKEN);
   const deviceId = read(STORE_DEVICE_ID);
+  const glDevId = read(STORE_GL_DEV_ID) || deviceId;
 
   if (!refreshToken || !deviceId) {
     log("refreshAccessTokenStrict failed: missing refreshToken/deviceId");
-    notify("领克凭证缺失", "缺少 refreshToken/deviceId", "请退出领克 App 后重新登录，让 Loon 抓 auth/login 响应");
+    notify("领克凭证缺失", "缺少 refreshToken/deviceId", "请打开 App 等待 /auth/login/refresh，必要时重新登录");
     return "";
   }
 
@@ -499,7 +521,7 @@ async function refreshAccessTokenStrict() {
     "refreshToken=" + encodeURIComponent(refreshToken) +
     "&deviceId=" + encodeURIComponent(deviceId) +
     "&deviceType=IOS" +
-    "&appVersion=4.2.0";
+    "&appVersion=" + encodeURIComponent(APP_VERSION);
 
   const url = OAUTH_HOST + EP_REFRESH + "?" + query;
 
@@ -509,17 +531,18 @@ async function refreshAccessTokenStrict() {
     "content-type": "application/json; charset=UTF-8",
     "publicplatform": "iOS",
     "user-agent": "CA_iOS_SDK_2.0",
-    "token": "",
-    "gl_dev_id": deviceId,
-    "appversioncode": "4.2.0",
-    "appversionname": "40200106",
-    "gl_app_version": "4.2.0",
-    "gl_app_build": "40200106",
+    "token": read(STORE_TOKEN) || "",
+    "gl_dev_id": glDevId,
+    "appversioncode": APP_VERSION,
+    "appversionname": APP_BUILD,
+    "gl_app_version": APP_VERSION,
+    "gl_app_build": APP_BUILD,
     "x-ca-version": "1"
   };
 
   log("Refresh accessToken start");
   log("Refresh deviceId = " + mask(deviceId, 8, 6));
+  log("Refresh gl_dev_id = " + mask(glDevId, 8, 6));
   log("Refresh refreshToken = " + mask(refreshToken, 12, 8));
 
   try {
@@ -594,10 +617,24 @@ async function doDailySign(token) {
 
   const ret = await apiCall("POST", EP_DAILY_SIGN, token, {});
   const obj = ret.obj || {};
+  const code = String(obj.code || "");
   const text = JSON.stringify(obj);
 
-  if (ret.status === 200 && String(obj.code || "") === "success") {
-    notify("领克签到完成", "", obj.message || text.slice(0, 120));
+  const signSuccess =
+    ret.status === 200 &&
+    (
+      code === "success" ||
+      code === "200" ||
+      obj.success === true ||
+      text.includes("签到成功") ||
+      text.includes("操作成功")
+    );
+
+  if (signSuccess) {
+    const data = obj.data || {};
+    const tip = data.messageTip || obj.message || "签到成功";
+    const reward = data.rewardEnergyNumber ? "奖励 " + data.rewardEnergyNumber + " 能量体" : "";
+    notify("领克签到完成", tip, reward);
     return true;
   }
 
@@ -621,7 +658,7 @@ async function getSignInfo(token) {
   const ret = await apiCall("GET", EP_SIGN_INFO, token);
   const obj = ret.obj || {};
 
-  if (ret.status !== 200 || String(obj.code || "") !== "success") return;
+  if (!isApiSuccess(ret)) return;
 
   const data = obj.data || {};
   const days = data.continueDays || data.continuousDays || data.signDays || "";
@@ -635,9 +672,8 @@ async function getTaskList(token) {
   log("Task list start");
 
   const ret = await apiCall("GET", EP_TASK_LIST, token);
-  const obj = ret.obj || {};
 
-  if (ret.status === 200 && String(obj.code || "") === "success") {
+  if (isApiSuccess(ret)) {
     log("Task list OK");
   }
 }
@@ -948,45 +984,19 @@ async function doArticleShare(token, shareCode) {
 
 /* =========================
  * Passive Capture
+ * 这里只保留 /auth/login/refresh 的抓取。
  * ========================= */
-function isGetShareCodeUrl(url) {
-  const text = String(url || "");
-  return (
-    text.includes("/app/v1/task/getShareCode") &&
-    (
-      text.includes("app-services.lynkco.com.cn") ||
-      text.includes("app-api-gw-toc.lynkco.com")
-    )
-  );
-}
-
-function extractArticleIdFromRiskRequestInfo(headers) {
-  const raw = getHeader(headers, "risk_request_info");
-  if (!raw) return "";
-
-  try {
-    const info = JSON.parse(raw);
-    const url = String(info.shareContentURL || "");
-    const match = url.match(/[?&]id=([^&]+)/);
-    return match ? decodeURIComponent(match[1]) : "";
-  } catch (e) {
-    const match = String(raw).match(/[?&]id=([^&"}]+)/);
-    return match ? decodeURIComponent(match[1]) : "";
-  }
-}
-
 function handleHttpRequest() {
   const url = $request.url || "";
   const headers = $request.headers || {};
   const query = parseUrlQuery(url);
+  const deviceInfo = extractDeviceInfoFromUrlOrHeaders(url, headers);
 
   log("HTTP_REQUEST URL = " + url);
   log("SCRIPT_VERSION = " + SCRIPT_VERSION);
 
   const token = getHeader(headers, "token");
   const svcsid = getHeader(headers, "svcsid");
-
-  const deviceId = extractDeviceIdFromUrlOrHeaders(url, headers);
 
   const refreshToken =
     query.refreshToken ||
@@ -1005,9 +1015,14 @@ function handleHttpRequest() {
     log("svcsid saved = " + mask(svcsid, 12, 8));
   }
 
-  if (deviceId) {
-    write(deviceId, STORE_DEVICE_ID);
-    log("deviceId saved = " + mask(deviceId, 8, 6));
+  if (deviceInfo.deviceId) {
+    write(deviceInfo.deviceId, STORE_DEVICE_ID);
+    log("deviceId saved = " + mask(deviceInfo.deviceId, 8, 6));
+  }
+
+  if (deviceInfo.glDevId) {
+    write(deviceInfo.glDevId, STORE_GL_DEV_ID);
+    log("gl_dev_id saved = " + mask(deviceInfo.glDevId, 8, 6));
   }
 
   if (refreshToken) {
@@ -1015,8 +1030,8 @@ function handleHttpRequest() {
     log("refreshToken saved from request = " + mask(refreshToken, 12, 8));
   }
 
-  if (token || svcsid || deviceId || refreshToken) {
-    notify("领克抓包成功", "token/svcsid/refreshToken/deviceId", "已更新本地缓存");
+  if (token || svcsid || deviceInfo.deviceId || deviceInfo.glDevId || refreshToken) {
+    notify("领克抓包成功", "refreshToken/deviceId 已更新", "后续可自动签到分享");
   }
 
   $done({});
@@ -1027,74 +1042,52 @@ function handleHttpResponse() {
   const reqHeaders = ($request && $request.headers) || {};
   const body = ($response && $response.body) || "";
   const obj = parseJsonSafe(body);
+  const query = parseUrlQuery(url);
+  const deviceInfo = extractDeviceInfoFromUrlOrHeaders(url, reqHeaders);
 
   log("HTTP_RESPONSE URL = " + url);
   log("SCRIPT_VERSION = " + SCRIPT_VERSION);
 
-  const deviceId = extractDeviceIdFromUrlOrHeaders(url, reqHeaders);
+  const refreshTokenFromUrl =
+    query.refreshToken ||
+    query.refreshtoken ||
+    "";
 
-  if (deviceId) {
-    write(deviceId, STORE_DEVICE_ID);
-    log("deviceId saved from response request = " + mask(deviceId, 8, 6));
+  if (deviceInfo.deviceId) {
+    write(deviceInfo.deviceId, STORE_DEVICE_ID);
+    log("deviceId saved from response request = " + mask(deviceInfo.deviceId, 8, 6));
   }
 
-  if (url.includes("/auth/")) {
-    const refreshToken = extractRefreshTokenFromBody(obj);
-    const accessToken = extractAccessTokenFromBody(obj);
-
-    log("auth response body = " + String(body || "").slice(0, 1200));
-
-    if (refreshToken) {
-      write(refreshToken, STORE_REFRESH_TOKEN);
-      log("refreshToken saved from auth response = " + mask(refreshToken, 12, 8));
-    }
-
-    if (accessToken) {
-      write(accessToken, STORE_ACCESS_TOKEN);
-      write(accessToken, STORE_TOKEN);
-      write(accessToken, STORE_SVCSID);
-      write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
-      log("accessToken saved from auth response = " + mask(accessToken, 12, 8));
-    }
-
-    if (refreshToken || accessToken) {
-      notify("领克登录信息已保存", "refreshToken/accessToken", "后续可自动签到");
-    } else if (deviceId) {
-      notify("领克 deviceId 已保存", "还缺 refreshToken", "需要抓到 mobileCodeLogin 或 refresh 响应");
-    } else {
-      log("auth response has no refreshToken/accessToken/deviceId");
-    }
-
-    $done({});
-    return;
+  if (deviceInfo.glDevId) {
+    write(deviceInfo.glDevId, STORE_GL_DEV_ID);
+    log("gl_dev_id saved from response request = " + mask(deviceInfo.glDevId, 8, 6));
   }
 
-  if (isGetShareCodeUrl(url)) {
-    const token = getHeader(reqHeaders, "token");
-    const svcsid = getHeader(reqHeaders, "svcsid");
+  if (refreshTokenFromUrl) {
+    write(refreshTokenFromUrl, STORE_REFRESH_TOKEN);
+    log("refreshToken saved from response url = " + mask(refreshTokenFromUrl, 12, 8));
+  }
 
-    if (token) {
-      write(token, STORE_TOKEN);
-      log("token saved from getShareCode = " + mask(token, 12, 8));
-    }
+  const refreshToken = extractRefreshTokenFromBody(obj);
+  const accessToken = extractAccessTokenFromBody(obj);
 
-    if (svcsid) {
-      write(svcsid, STORE_SVCSID);
-      log("svcsid saved from getShareCode = " + mask(svcsid, 12, 8));
-    }
+  log("auth refresh response body = " + String(body || "").slice(0, 1200));
 
-    log("getShareCode response body = " + String(body || "").slice(0, 1200));
+  if (refreshToken) {
+    write(refreshToken, STORE_REFRESH_TOKEN);
+    log("refreshToken saved from response body = " + mask(refreshToken, 12, 8));
+  }
 
-    const shareCode = extractShareCode(obj);
-    const articleId = extractArticleIdFromRiskRequestInfo(reqHeaders);
+  if (accessToken) {
+    write(accessToken, STORE_ACCESS_TOKEN);
+    write(accessToken, STORE_TOKEN);
+    write(accessToken, STORE_SVCSID);
+    write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
+    log("accessToken saved from response body = " + mask(accessToken, 12, 8));
+  }
 
-    if (shareCode) {
-      saveShareCode(shareCode, "http-response", articleId);
-      notify("领克 shareCode 已保存", formatGmt8Day(Date.now()), mask(shareCode, 12, 8));
-    }
-
-    $done({});
-    return;
+  if (refreshTokenFromUrl || refreshToken || accessToken || deviceInfo.deviceId || deviceInfo.glDevId) {
+    notify("领克登录信息已保存", "refreshToken/deviceId", "后续可自动签到分享");
   }
 
   $done({});
@@ -1106,6 +1099,7 @@ function handleHttpResponse() {
 function logStoredState() {
   log("Stored refreshToken = " + mask(read(STORE_REFRESH_TOKEN), 12, 8));
   log("Stored deviceId = " + mask(read(STORE_DEVICE_ID), 8, 6));
+  log("Stored gl_dev_id = " + mask(read(STORE_GL_DEV_ID), 8, 6));
   log("Stored accessToken = " + mask(read(STORE_ACCESS_TOKEN), 12, 8));
   log("Stored token = " + mask(read(STORE_TOKEN), 12, 8));
   log("Stored svcsid = " + mask(read(STORE_SVCSID), 12, 8));
@@ -1124,11 +1118,6 @@ async function runCron() {
   logStoredState();
 
   try {
-    /*
-     * 关键点：
-     * 这里必须严格按 Python 方式 refresh。
-     * 签到不再 fallback 使用 H5 token。
-     */
     const accessToken = await refreshAccessTokenStrict();
 
     if (!accessToken) {

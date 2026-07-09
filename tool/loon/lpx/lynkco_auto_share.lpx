@@ -8,14 +8,6 @@ http-request ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/refresh.* sc
 
 http-response ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/refresh.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓RefreshResponse
 
-http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓H5Token
-
-http-request ^https:\/\/app-services\.lynkco\.com\.cn\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓AppServicesRequest
-
-http-response ^https:\/\/app-services\.lynkco\.com\.cn\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓AppServicesResponse
-
-http-response ^https:\/\/(app-services\.lynkco\.com\.cn|app-api-gw-toc\.lynkco\.com)\/app\/v1\/task\/getShareCode script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓ShareCode
-
 cron "23 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=90, tag=领克每日签到分享
 
 [MITM]

@@ -1,41 +1,48 @@
 /*
-领克每日自动分享脚本
-适用：Loon 3.3.9+
+领克每日签到 + 自动分享脚本
+适用：Loon 3.5.0+
 
-功能说明：
-1. 自动抓取 token / svcsid。
-2. 支持被动抓取 getShareCode 响应里的当天 shareCode。
-3. 支持 cron 运行时主动请求 /app/v1/task/getShareCode 获取 shareCode。
-4. 定时从探索页获取文章列表。
-5. 自动选择一篇未分享过的文章。
-6. 自动请求文章详情，相当于进入文章。
-7. 自动上报 ReadCount。
-8. 自动上报 ShareCount。
-9. 自动调用 shareReporting，完成 Co 积分分享任务。
+核心思路：
+1. 参考 sy5t4w-del/lynk_auto_sign：
+   - refreshToken + deviceId -> accessToken
+   - /up/api/v1/user/sign 签到
+   - /app/v1/task/getShareCode 主动获取 shareCode
+2. 合并当前 Loon 抓包能力：
+   - 自动抓 token / svcsid
+   - 自动抓 refreshToken / deviceId
+   - 兼容旧 H5 分享任务链路
 
-Loon 配置示例：
+Loon 插件建议：
 
 [Script]
-# 抓 token / svcsid
-http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=lynkco_auto_share.js, requires-body=false, timeout=30, tag=领克抓Token
+# 抓 H5 token / svcsid
+http-request ^https:\/\/h5-api\.lynkco\.com\/app\/explore\/home-page\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓Token
 
-# 可选：被动抓 getShareCode 响应，作为兜底缓存
-http-response ^https:\/\/(app-services\.lynkco\.com\.cn|app-api-gw-toc\.lynkco\.com)\/app\/v1\/task\/getShareCode script-path=lynkco_auto_share.js, requires-body=true, timeout=30, tag=领克抓ShareCode
+# 抓登录/刷新响应里的 refreshToken，可选但建议保留
+http-response ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/.* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓RefreshToken
+
+# 可选：被动抓 getShareCode，作为兜底
+http-response ^https:\/\/(app-services\.lynkco\.com\.cn|app-api-gw-toc\.lynkco\.com)\/app\/v1\/task\/getShareCode script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓ShareCode
 
 # 定时执行
-cron "23 8,20 * * *" script-path=lynkco_auto_share.js, timeout=60, tag=领克每日自动分享
+cron "23 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=90, tag=领克每日签到分享
 
 [MITM]
 hostname = h5-api.lynkco.com, h5.lynkco.com, app-services.lynkco.com.cn, app-api-gw-toc.lynkco.com
 */
 
-const SCRIPT_VERSION = "2026-07-09-direct-getShareCode-v1";
+const SCRIPT_VERSION = "2026-07-09-loon-merged-sign-share-v1";
 
 /* =========================
- * Persistent Store Keys
+ * Store Keys
  * ========================= */
 const STORE_TOKEN = "lynkco_token";
 const STORE_SVCSID = "lynkco_svcsid";
+const STORE_REFRESH_TOKEN = "lynkco_refresh_token";
+const STORE_DEVICE_ID = "lynkco_device_id";
+const STORE_ACCESS_TOKEN = "lynkco_access_token";
+const STORE_ACCESS_TOKEN_DAY = "lynkco_access_token_day";
+
 const STORE_USED_IDS = "lynkco_used_article_ids";
 
 const STORE_SHARE_CODE = "lynkco_share_code";
@@ -56,7 +63,14 @@ const CA_SECRET = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
 const H5_API_HOST = "https://h5-api.lynkco.com";
 const H5_HOST = "https://h5.lynkco.com";
 const APP_API_GW_HOST = "https://app-api-gw-toc.lynkco.com";
+const OAUTH_HOST = "https://app-services.lynkco.com.cn";
 
+const EP_REFRESH = "/auth/login/refresh";
+
+const EP_DAILY_SIGN = "/up/api/v1/user/sign";
+const EP_SIGN_INFO = "/up/api/v1/userReward/getContinueDaysAndSignCard";
+const EP_TASK_LIST = "/up/api/v1/userReward/getTaskList";
+const EP_ENERGY = "/app/energy/myEnergy";
 const EP_GET_SHARE_CODE = "/app/v1/task/getShareCode";
 
 /* =========================
@@ -78,6 +92,7 @@ function read(key) {
 }
 
 function write(value, key) {
+  if (value === undefined || value === null || value === "") return false;
   return $persistentStore.write(String(value), key);
 }
 
@@ -101,6 +116,14 @@ function uuid() {
     const v = c === "x" ? r : (r & 0x3 | 0x8);
     return v.toString(16);
   });
+}
+
+function parseJsonSafe(text) {
+  try {
+    return JSON.parse(text || "{}");
+  } catch (e) {
+    return {};
+  }
 }
 
 function request(method, url, headers, body) {
@@ -133,17 +156,90 @@ function request(method, url, headers, body) {
   });
 }
 
-function parseJsonSafe(text) {
-  try {
-    return JSON.parse(text || "{}");
-  } catch (e) {
-    return {};
-  }
+function pad2(n) {
+  return n < 10 ? "0" + n : String(n);
+}
+
+function formatGmt8Day(now) {
+  const d = new Date((now || Date.now()) + 8 * 60 * 60 * 1000);
+  return (
+    d.getUTCFullYear() + "-" +
+    pad2(d.getUTCMonth() + 1) + "-" +
+    pad2(d.getUTCDate())
+  );
 }
 
 /* =========================
- * HMAC SHA256 Implementation
- * Loon 环境下不依赖 CryptoJS
+ * URL Utils
+ * ========================= */
+function parseUrlQuery(url) {
+  const out = {};
+  const text = String(url || "");
+  const idx = text.indexOf("?");
+  if (idx < 0) return out;
+
+  const q = text.slice(idx + 1);
+  q.split("&").forEach(pair => {
+    if (!pair) return;
+    const eq = pair.indexOf("=");
+    if (eq < 0) {
+      out[decodeURIComponent(pair)] = "";
+    } else {
+      const k = decodeURIComponent(pair.slice(0, eq));
+      const v = decodeURIComponent(pair.slice(eq + 1));
+      out[k] = v;
+    }
+  });
+
+  return out;
+}
+
+function extractDeviceIdFromUrl(url) {
+  const q = parseUrlQuery(url);
+  return q.deviceId || q.deviceid || q.gl_dev_id || "";
+}
+
+function extractTokenFromObject(obj) {
+  if (!obj) return "";
+
+  const paths = [
+    obj.refreshToken,
+    obj.data && obj.data.refreshToken,
+    obj.data && obj.data.centerTokenDto && obj.data.centerTokenDto.refreshToken,
+    obj.centerTokenDto && obj.centerTokenDto.refreshToken,
+    obj.token && String(obj.token).includes("bearer") ? obj.token : "",
+    obj.data && obj.data.token && String(obj.data.token).includes("bearer") ? obj.data.token : ""
+  ];
+
+  for (const p of paths) {
+    if (p && typeof p === "string") return p;
+  }
+
+  return "";
+}
+
+function extractAccessTokenFromObject(obj) {
+  if (!obj) return "";
+
+  const paths = [
+    obj.accessToken,
+    obj.data && obj.data.accessToken,
+    obj.data && obj.data.centerTokenDto && obj.data.centerTokenDto.token,
+    obj.centerTokenDto && obj.centerTokenDto.token,
+    obj.token,
+    obj.data && obj.data.token
+  ];
+
+  for (const p of paths) {
+    if (p && typeof p === "string") return p;
+  }
+
+  return "";
+}
+
+/* =========================
+ * SHA256 + HMAC
+ * 不依赖 CryptoJS
  * ========================= */
 function rightRotate(value, amount) {
   return (value >>> amount) | (value << (32 - amount));
@@ -206,10 +302,7 @@ function sha256Bytes(inputBytes) {
   const bitLen = bytes.length * 8;
 
   bytes.push(0x80);
-
-  while ((bytes.length % 64) !== 56) {
-    bytes.push(0);
-  }
+  while ((bytes.length % 64) !== 56) bytes.push(0);
 
   for (let i = 7; i >= 0; i--) {
     bytes.push((bitLen / Math.pow(256, i)) & 0xff);
@@ -232,20 +325,13 @@ function sha256Bytes(inputBytes) {
       w[j] = (w[j - 16] + s0 + w[j - 7] + s1) | 0;
     }
 
-    let a = H[0];
-    let b = H[1];
-    let c = H[2];
-    let d = H[3];
-    let e = H[4];
-    let f = H[5];
-    let g = H[6];
-    let h = H[7];
+    let a = H[0], b = H[1], c = H[2], d = H[3];
+    let e = H[4], f = H[5], g = H[6], h = H[7];
 
     for (let j = 0; j < 64; j++) {
       const S1 = rightRotate(e, 6) ^ rightRotate(e, 11) ^ rightRotate(e, 25);
       const ch = (e & f) ^ ((~e) & g);
       const temp1 = (h + S1 + ch + K[j] + w[j]) | 0;
-
       const S0 = rightRotate(a, 2) ^ rightRotate(a, 13) ^ rightRotate(a, 22);
       const maj = (a & b) ^ (a & c) ^ (b & c);
       const temp2 = (S0 + maj) | 0;
@@ -271,7 +357,6 @@ function sha256Bytes(inputBytes) {
   }
 
   const out = [];
-
   for (const h of H) {
     out.push((h >>> 24) & 0xff);
     out.push((h >>> 16) & 0xff);
@@ -290,7 +375,6 @@ function base64(bytes) {
     const a = bytes[i];
     const b = i + 1 < bytes.length ? bytes[i + 1] : 0;
     const c = i + 2 < bytes.length ? bytes[i + 2] : 0;
-
     const n = (a << 16) | (b << 8) | c;
 
     out += chars[(n >>> 18) & 63];
@@ -309,9 +393,7 @@ function hmacSha256Base64(message, key) {
     keyBytes = sha256Bytes(keyBytes);
   }
 
-  while (keyBytes.length < 64) {
-    keyBytes.push(0);
-  }
+  while (keyBytes.length < 64) keyBytes.push(0);
 
   const oKey = [];
   const iKey = [];
@@ -327,20 +409,17 @@ function hmacSha256Base64(message, key) {
 }
 
 /* =========================
- * Sign Headers
+ * API Gateway Signature
+ * 按 lynk_auto_sign 风格
  * ========================= */
 function canonicalizePathForSign(pathWithQuery) {
-  if (!pathWithQuery.includes("?")) {
-    return pathWithQuery;
-  }
+  if (!pathWithQuery.includes("?")) return pathWithQuery;
 
   const parts = pathWithQuery.split("?");
   const path = parts[0];
   const query = parts.slice(1).join("?");
 
-  if (!query) {
-    return path;
-  }
+  if (!query) return path;
 
   const params = query
     .split("&")
@@ -355,12 +434,9 @@ function canonicalizePathForSign(pathWithQuery) {
         };
       }
 
-      const key = decodeURIComponent(item.slice(0, idx));
-      const value = decodeURIComponent(item.slice(idx + 1));
-
       return {
-        key: key,
-        value: value
+        key: decodeURIComponent(item.slice(0, idx)),
+        value: decodeURIComponent(item.slice(idx + 1))
       };
     });
 
@@ -370,19 +446,60 @@ function canonicalizePathForSign(pathWithQuery) {
   });
 
   const canonicalQuery = params.map(p => {
-    if (p.value === null || p.value === "") {
-      return encodeURIComponent(p.key);
-    }
-
+    if (p.value === null || p.value === "") return encodeURIComponent(p.key);
     return encodeURIComponent(p.key) + "=" + encodeURIComponent(p.value);
   }).join("&");
 
   return path + "?" + canonicalQuery;
 }
 
-function buildH5SignedHeaders(method, pathWithQuery) {
-  const token = read(STORE_TOKEN);
-  const svcsid = read(STORE_SVCSID);
+function buildApiSignedHeaders(method, pathWithQuery, token) {
+  const timestamp = String(Date.now());
+  const nonce = uuid().toUpperCase();
+
+  const accept = "*/*";
+  const contentType = "application/json";
+  const signPath = canonicalizePathForSign(pathWithQuery);
+
+  const stringToSign = [
+    method.toUpperCase(),
+    accept,
+    "",
+    contentType,
+    "",
+    `X-Ca-Key:${CA_KEY}`,
+    `X-Ca-Nonce:${nonce}`,
+    "X-Ca-Signature-Method:HmacSHA256",
+    `X-Ca-Timestamp:${timestamp}`,
+    signPath
+  ].join("\n");
+
+  const signature = hmacSha256Base64(stringToSign, CA_SECRET);
+
+  log("Sign " + method.toUpperCase() + " signPath = " + signPath);
+
+  return {
+    "token": token || "",
+    "content-type": contentType,
+    "accept": accept,
+    "x-ca-key": CA_KEY,
+    "x-ca-nonce": nonce,
+    "x-ca-signature-method": "HmacSHA256",
+    "x-ca-timestamp": timestamp,
+    "x-ca-signature-headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
+    "x-ca-signature": signature,
+    "authorization": `APPCODE ${APP_CODE}`,
+    "authentication": `AppId=${APP_ID}`,
+    "origin": H5_HOST,
+    "referer": H5_HOST + "/",
+    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/4.2.0 appVersionName/40200106",
+    "acl-app": "BUYER"
+  };
+}
+
+function buildH5SignedHeaders(method, pathWithQuery, tokenOverride) {
+  const token = tokenOverride || read(STORE_TOKEN) || read(STORE_ACCESS_TOKEN) || "";
+  const svcsid = read(STORE_SVCSID) || token;
 
   const timestamp = String(Date.now());
   const nonce = uuid();
@@ -406,26 +523,23 @@ function buildH5SignedHeaders(method, pathWithQuery) {
 
   const signature = hmacSha256Base64(stringToSign, CA_SECRET);
 
-  log("Sign " + method.toUpperCase() + " requestPath = " + pathWithQuery);
-  log("Sign " + method.toUpperCase() + " signPath = " + signPath);
-
   return {
     "svcsid": svcsid || token || "",
     "origin": H5_HOST,
     "x-ca-signature-headers": "X-Ca-Key,X-Ca-Timestamp,X-Ca-Nonce,X-Ca-Signature-Method",
     "x-ca-key": CA_KEY,
-    "appversioncode": "4.1.9",
+    "appversioncode": "4.2.0",
     "token": token || "",
     "x-ca-nonce": nonce,
     "content-type": contentType,
     "authentication": `AppId=${APP_ID}`,
     "accept": accept,
     "authorization": `APPCODE ${APP_CODE}`,
-    "appversionname": "40109027",
+    "appversionname": "40200106",
     "x-ca-signature": signature,
     "referer": H5_HOST + "/",
     "accept-language": "zh-CN,zh-Hans;q=0.9",
-    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/4.1.9 appVersionName/40109027",
+    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/4.2.0 appVersionName/40200106",
     "acl-app": "BUYER",
     "x-ca-timestamp": timestamp,
     "x-ca-signature-method": "HmacSHA256"
@@ -433,17 +547,190 @@ function buildH5SignedHeaders(method, pathWithQuery) {
 }
 
 /* =========================
- * ShareCode Logic
+ * Token Refresh
  * ========================= */
-function isGetShareCodeUrl(url) {
-  const text = String(url || "");
-  return (
-    text.includes("/app/v1/task/getShareCode") &&
-    (
-      text.includes("app-services.lynkco.com.cn") ||
-      text.includes("app-api-gw-toc.lynkco.com")
-    )
-  );
+async function refreshAccessToken() {
+  const refreshToken = read(STORE_REFRESH_TOKEN);
+  const deviceId = read(STORE_DEVICE_ID);
+
+  if (!refreshToken || !deviceId) {
+    log("refreshAccessToken skipped: missing refreshToken/deviceId");
+    return "";
+  }
+
+  const query =
+    "refreshToken=" + encodeURIComponent(refreshToken) +
+    "&deviceId=" + encodeURIComponent(deviceId) +
+    "&deviceType=IOS" +
+    "&appVersion=4.2.0";
+
+  const url = OAUTH_HOST + EP_REFRESH + "?" + query;
+
+  const headers = {
+    "Authorization": `APPCODE ${APP_CODE}`,
+    "accept": "application/json",
+    "content-type": "application/json; charset=UTF-8",
+    "publicplatform": "iOS",
+    "user-agent": "CA_iOS_SDK_2.0",
+    "token": "",
+    "gl_dev_id": deviceId,
+    "appversioncode": "4.2.0",
+    "appversionname": "40200106",
+    "gl_app_version": "4.2.0",
+    "gl_app_build": "40200106",
+    "x-ca-version": "1"
+  };
+
+  log("Refresh accessToken start");
+  log("Refresh deviceId = " + mask(deviceId, 8, 6));
+  log("Refresh refreshToken = " + mask(refreshToken, 12, 8));
+
+  try {
+    const ret = await request("GET", url, headers);
+    log("Refresh HTTP = " + ret.resp.status);
+    log("Refresh body = " + String(ret.data || "").slice(0, 1000));
+
+    if (Number(ret.resp.status) !== 200) return "";
+
+    const obj = parseJsonSafe(ret.data);
+    if (String(obj.code || "") !== "success") return "";
+
+    const dto = (obj.data && obj.data.centerTokenDto) || {};
+    const accessToken = dto.token || "";
+    const newRefreshToken = dto.refreshToken || "";
+
+    if (accessToken) {
+      write(accessToken, STORE_ACCESS_TOKEN);
+      write(accessToken, STORE_TOKEN);
+      write(accessToken, STORE_SVCSID);
+      write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
+      log("accessToken saved = " + mask(accessToken, 12, 8));
+    }
+
+    if (newRefreshToken && newRefreshToken !== refreshToken) {
+      write(newRefreshToken, STORE_REFRESH_TOKEN);
+      log("refreshToken updated = " + mask(newRefreshToken, 12, 8));
+    }
+
+    return accessToken;
+  } catch (e) {
+    log("refreshAccessToken error = " + e);
+    return "";
+  }
+}
+
+async function getBusinessToken() {
+  let token = "";
+
+  token = await refreshAccessToken();
+
+  if (token) return token;
+
+  token = read(STORE_ACCESS_TOKEN) || read(STORE_TOKEN) || read(STORE_SVCSID) || "";
+
+  if (token) {
+    log("Use fallback token = " + mask(token, 12, 8));
+  }
+
+  return token;
+}
+
+/* =========================
+ * API Business Calls
+ * ========================= */
+async function apiCall(method, pathWithQuery, token, body) {
+  const url = APP_API_GW_HOST + pathWithQuery;
+  const headers = buildApiSignedHeaders(method, pathWithQuery, token);
+
+  log("API request " + method + " " + url);
+
+  const ret = await request(method, url, headers, body);
+  log("API HTTP = " + ret.resp.status);
+  log("API body = " + String(ret.data || "").slice(0, 1000));
+
+  return {
+    status: Number(ret.resp.status),
+    obj: parseJsonSafe(ret.data),
+    raw: ret.data || ""
+  };
+}
+
+async function doDailySign(token) {
+  log("Daily sign start");
+
+  const ret = await apiCall("POST", EP_DAILY_SIGN, token, {});
+  const obj = ret.obj || {};
+  const allText = JSON.stringify(obj);
+
+  if (ret.status === 200 && String(obj.code || "") === "success") {
+    notify("领克签到完成", "", obj.message || allText.slice(0, 120));
+    return true;
+  }
+
+  if (
+    allText.includes("已签到") ||
+    allText.includes("已经签到") ||
+    allText.includes("今日已") ||
+    allText.includes("重复")
+  ) {
+    notify("领克今日已签到", "", obj.message || allText.slice(0, 120));
+    return true;
+  }
+
+  notify("领克签到失败", "HTTP " + ret.status, allText.slice(0, 200));
+  return false;
+}
+
+async function getSignInfo(token) {
+  log("Sign info start");
+
+  const ret = await apiCall("GET", EP_SIGN_INFO, token);
+  const obj = ret.obj || {};
+
+  if (ret.status !== 200 || String(obj.code || "") !== "success") return;
+
+  const data = obj.data || {};
+  const days =
+    data.continueDays ||
+    data.continuousDays ||
+    data.signDays ||
+    "";
+
+  const cards =
+    data.signCardNumber ||
+    data.signCardNum ||
+    "";
+
+  log("Sign continue days = " + days);
+  log("Sign card number = " + cards);
+
+  if (days !== "" || cards !== "") {
+    notify(
+      "领克签到信息",
+      days !== "" ? "连续签到 " + days + " 天" : "",
+      cards !== "" ? "补签卡 " + cards + " 张" : ""
+    );
+  }
+}
+
+async function getTaskList(token) {
+  log("Task list start");
+
+  const ret = await apiCall("GET", EP_TASK_LIST, token);
+  const obj = ret.obj || {};
+
+  if (ret.status !== 200 || String(obj.code || "") !== "success") return;
+
+  log("Task list body parsed OK");
+}
+
+function extractShareCode(obj) {
+  if (!obj) return "";
+  if (typeof obj.data === "string") return obj.data;
+  if (obj.data && typeof obj.data.shareCode === "string") return obj.data.shareCode;
+  if (obj.data && typeof obj.data.code === "string") return obj.data.code;
+  if (typeof obj.shareCode === "string") return obj.shareCode;
+  return "";
 }
 
 function buildShareUrl(articleId) {
@@ -458,44 +745,6 @@ function buildShareUrl(articleId) {
 
 function buildShareUrlWithCode(articleId, shareCode) {
   return buildShareUrl(articleId) + "&shareCode=" + encodeURIComponent(shareCode);
-}
-
-function pad2(n) {
-  return n < 10 ? "0" + n : String(n);
-}
-
-function formatGmt8Day(now) {
-  const d = new Date((now || Date.now()) + 8 * 60 * 60 * 1000);
-  return (
-    d.getUTCFullYear() + "-" +
-    pad2(d.getUTCMonth() + 1) + "-" +
-    pad2(d.getUTCDate())
-  );
-}
-
-function extractShareCode(obj) {
-  if (!obj) return "";
-  if (typeof obj.data === "string") return obj.data;
-  if (obj.data && typeof obj.data.shareCode === "string") return obj.data.shareCode;
-  if (obj.data && typeof obj.data.code === "string") return obj.data.code;
-  if (typeof obj.shareCode === "string") return obj.shareCode;
-  return "";
-}
-
-function extractArticleIdFromRiskRequestInfo(headers) {
-  const raw = getHeader(headers, "risk_request_info");
-
-  if (!raw) return "";
-
-  try {
-    const info = JSON.parse(raw);
-    const url = String(info.shareContentURL || "");
-    const match = url.match(/[?&]id=([^&]+)/);
-    return match ? decodeURIComponent(match[1]) : "";
-  } catch (e) {
-    const match = String(raw).match(/[?&]id=([^&"}]+)/);
-    return match ? decodeURIComponent(match[1]) : "";
-  }
 }
 
 function saveShareCode(shareCode, source, articleId) {
@@ -516,7 +765,6 @@ function saveShareCode(shareCode, source, articleId) {
   log("shareCode day = " + day);
   log("shareCode source = " + (source || "unknown"));
   log("shareCode articleId = " + (articleId || ""));
-  log("shareUrl = " + (shareUrl || "empty"));
 }
 
 function getTodayShareCode() {
@@ -529,164 +777,31 @@ function getTodayShareCode() {
     return shareCode;
   }
 
-  if (shareCode) {
-    log("Cached shareCode ignored, stored day = " + (shareCodeDay || "empty") + ", today = " + today);
-  }
-
   return "";
 }
 
-async function fetchShareCodeDirect() {
-  const token = read(STORE_TOKEN);
-  const svcsid = read(STORE_SVCSID);
+async function fetchShareCodeDirect(token) {
+  let cached = getTodayShareCode();
+  if (cached) return cached;
 
-  if (!token && !svcsid) {
-    log("fetchShareCodeDirect failed: empty token/svcsid");
-    return "";
-  }
+  log("Direct getShareCode start");
 
-  const path = EP_GET_SHARE_CODE;
-  const url = APP_API_GW_HOST + path;
+  const ret = await apiCall("GET", EP_GET_SHARE_CODE, token);
+  const shareCode = extractShareCode(ret.obj);
 
-  log("Request direct getShareCode: " + url);
-
-  try {
-    const ret = await request(
-      "GET",
-      url,
-      buildH5SignedHeaders("GET", path)
-    );
-
-    log("Direct getShareCode HTTP = " + ret.resp.status);
-    log("Direct getShareCode body = " + String(ret.data || "").slice(0, 1000));
-
-    if (Number(ret.resp.status) !== 200) {
-      log("Direct getShareCode failed: HTTP " + ret.resp.status);
-      return "";
-    }
-
-    const obj = parseJsonSafe(ret.data);
-    const code = String(obj.code || "");
-    const shareCode = extractShareCode(obj);
-
-    log("Direct getShareCode code = " + code);
-    log("Direct getShareCode shareCode = " + mask(shareCode, 12, 8));
-
-    if (!shareCode) {
-      return "";
-    }
-
+  if (ret.status === 200 && shareCode) {
     saveShareCode(shareCode, "direct-api", "");
-    notify("LynkCo shareCode direct OK", formatGmt8Day(Date.now()), mask(shareCode, 12, 8));
-
+    notify("领克 shareCode 获取成功", formatGmt8Day(Date.now()), mask(shareCode, 12, 8));
     return shareCode;
-  } catch (e) {
-    log("fetchShareCodeDirect error = " + e);
-    return "";
   }
+
+  notify("领克 shareCode 获取失败", "HTTP " + ret.status, String(ret.raw || "").slice(0, 200));
+  return "";
 }
 
 /* =========================
- * Stored State
- * ========================= */
-function logStoredState() {
-  const token = read(STORE_TOKEN);
-  const svcsid = read(STORE_SVCSID);
-  const shareCode = read(STORE_SHARE_CODE);
-  const shareCodeDay = read(STORE_SHARE_CODE_DAY);
-  const shareCodeSource = read(STORE_SHARE_CODE_SOURCE);
-  const shareCodeArticleId = read(STORE_SHARE_CODE_ARTICLE_ID);
-  const shareUrl = read(STORE_SHARE_URL);
-  const usedRaw = read(STORE_USED_IDS) || "[]";
-
-  log("Stored token = " + mask(token, 12, 8));
-  log("Stored svcsid = " + mask(svcsid, 12, 8));
-  log("Stored shareCode = " + mask(shareCode, 12, 8));
-  log("Stored shareCode day = " + (shareCodeDay || "empty"));
-  log("Stored shareCode source = " + (shareCodeSource || "empty"));
-  log("Stored shareCode articleId = " + (shareCodeArticleId || "empty"));
-  log("Stored shareUrl = " + (shareUrl ? String(shareUrl).slice(0, 220) : "empty"));
-  log("Stored used ids = " + usedRaw);
-}
-
-/* =========================
- * Loon HTTP Request Handler
- * ========================= */
-function handleHttpRequest() {
-  const url = $request.url || "";
-  const headers = $request.headers || {};
-
-  log("HTTP_REQUEST URL = " + url);
-  log("SCRIPT_VERSION = " + SCRIPT_VERSION);
-
-  const token = getHeader(headers, "token");
-  const svcsid = getHeader(headers, "svcsid");
-
-  if (token) {
-    write(token, STORE_TOKEN);
-    log("token saved = " + mask(token, 12, 8));
-  }
-
-  if (svcsid) {
-    write(svcsid, STORE_SVCSID);
-    log("svcsid saved = " + mask(svcsid, 12, 8));
-  }
-
-  if (token || svcsid) {
-    notify("LynkCo token saved", "Ready for article request", "token/svcsid OK");
-  }
-
-  $done({});
-}
-
-/* =========================
- * Loon HTTP Response Handler
- * 被动抓 getShareCode
- * ========================= */
-function handleHttpResponse() {
-  const url = ($request && $request.url) || "";
-  const headers = ($request && $request.headers) || {};
-  const body = ($response && $response.body) || "";
-
-  log("HTTP_RESPONSE URL = " + url);
-  log("SCRIPT_VERSION = " + SCRIPT_VERSION);
-
-  if (!isGetShareCodeUrl(url)) {
-    $done({});
-    return;
-  }
-
-  const token = getHeader(headers, "token");
-  const svcsid = getHeader(headers, "svcsid");
-
-  if (token) {
-    write(token, STORE_TOKEN);
-    log("token saved from getShareCode response = " + mask(token, 12, 8));
-  }
-
-  if (svcsid) {
-    write(svcsid, STORE_SVCSID);
-    log("svcsid saved from getShareCode response = " + mask(svcsid, 12, 8));
-  }
-
-  log("getShareCode response body = " + String(body || "").slice(0, 1200));
-
-  const obj = parseJsonSafe(body);
-  const shareCode = extractShareCode(obj);
-  const articleId = extractArticleIdFromRiskRequestInfo(headers);
-
-  if (shareCode) {
-    saveShareCode(shareCode, "http-response", articleId);
-    notify("LynkCo shareCode saved", formatGmt8Day(Date.now()), mask(shareCode, 12, 8));
-  } else {
-    notify("LynkCo shareCode capture failed", "Empty response code", String(body || "").slice(0, 120));
-  }
-
-  $done({});
-}
-
-/* =========================
- * Article Helpers
+ * Article Share Logic
+ * 保留你当前 Loon 脚本跑通的 H5 链路
  * ========================= */
 function extractArticleList(obj) {
   const candidates = [
@@ -703,9 +818,7 @@ function extractArticleList(obj) {
   ];
 
   for (const item of candidates) {
-    if (Array.isArray(item)) {
-      return item;
-    }
+    if (Array.isArray(item)) return item;
   }
 
   return [];
@@ -743,15 +856,6 @@ function getArticleDebugInfo(item, index) {
   ].join(" | ");
 }
 
-function logArticleCandidates(list) {
-  log("Article total in current page = " + list.length);
-
-  const max = Math.min(list.length, 5);
-  for (let i = 0; i < max; i++) {
-    log("Candidate article " + getArticleDebugInfo(list[i], i));
-  }
-}
-
 function pickArticle(list) {
   let used = [];
 
@@ -762,7 +866,6 @@ function pickArticle(list) {
   }
 
   log("Used article ids count = " + used.length);
-  log("Used article ids = " + JSON.stringify(used));
 
   for (let i = 0; i < list.length; i++) {
     const id = getArticleId(list[i]);
@@ -782,14 +885,7 @@ function pickArticle(list) {
     return list[i];
   }
 
-  const fallback = list.find(item => getArticleId(item));
-
-  if (fallback) {
-    log("All articles in this page may be used, fallback to first valid article");
-    log("Fallback article info = " + getArticleDebugInfo(fallback, list.indexOf(fallback)));
-  }
-
-  return fallback;
+  return list.find(item => getArticleId(item));
 }
 
 function saveUsedArticle(id) {
@@ -806,217 +902,345 @@ function saveUsedArticle(id) {
   write(JSON.stringify(used), STORE_USED_IDS);
 
   log("Saved used article id = " + id);
-  log("Updated used article ids = " + JSON.stringify(used));
+}
+
+async function doArticleShare(accessToken, shareCode) {
+  log("Article share start");
+
+  const listPath = "/app/explore/home-page/v2/page/pull?pageNo=1&pageSize=10&articleTypes=";
+  const listUrl = H5_API_HOST + listPath;
+
+  log("Request article list: " + listUrl);
+
+  const listRet = await request(
+    "GET",
+    listUrl,
+    buildH5SignedHeaders("GET", listPath, accessToken)
+  );
+
+  log("Article list HTTP = " + listRet.resp.status);
+  log("Article list body = " + String(listRet.data || "").slice(0, 1000));
+
+  if (Number(listRet.resp.status) !== 200) {
+    notify("领克分享失败", "文章列表 HTTP " + listRet.resp.status, String(listRet.data || "").slice(0, 200));
+    return false;
+  }
+
+  const listObj = parseJsonSafe(listRet.data);
+  const list = extractArticleList(listObj);
+
+  log("Article list code = " + (listObj.code || ""));
+  log("Article total in current page = " + list.length);
+
+  if (!list.length) {
+    notify("领克分享失败", "文章列表为空", String(listRet.data || "").slice(0, 200));
+    return false;
+  }
+
+  for (let i = 0; i < Math.min(list.length, 5); i++) {
+    log("Candidate article " + getArticleDebugInfo(list[i], i));
+  }
+
+  const article = pickArticle(list);
+  if (!article) {
+    notify("领克分享失败", "没有可用文章", "");
+    return false;
+  }
+
+  const articleId = getArticleId(article);
+  const title = getTitle(article);
+
+  if (!articleId) {
+    notify("领克分享失败", "无法解析文章 ID", JSON.stringify(article).slice(0, 200));
+    return false;
+  }
+
+  log("Selected article id = " + articleId);
+  log("Selected article title = " + title);
+
+  const detailPath = "/app/explore/home-page/article/content/" + articleId + "?typeCode=content";
+  const detailUrl = H5_API_HOST + detailPath;
+
+  const detailRet = await request(
+    "GET",
+    detailUrl,
+    buildH5SignedHeaders("GET", detailPath, accessToken)
+  );
+
+  log("Article detail HTTP = " + detailRet.resp.status);
+  log("Article detail body = " + String(detailRet.data || "").slice(0, 500));
+
+  const readPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ReadCount";
+  const readRet = await request(
+    "POST",
+    H5_API_HOST + readPath,
+    buildH5SignedHeaders("POST", readPath, accessToken),
+    {}
+  );
+
+  log("ReadCount HTTP = " + readRet.resp.status);
+  log("ReadCount body = " + String(readRet.data || "").slice(0, 500));
+
+  const shareCountPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ShareCount";
+  const shareCountRet = await request(
+    "POST",
+    H5_API_HOST + shareCountPath,
+    buildH5SignedHeaders("POST", shareCountPath, accessToken),
+    {}
+  );
+
+  log("ShareCount HTTP = " + shareCountRet.resp.status);
+  log("ShareCount body = " + String(shareCountRet.data || "").slice(0, 500));
+
+  const fullShareUrl = buildShareUrlWithCode(articleId, shareCode);
+  write(fullShareUrl, STORE_SHARE_URL);
+  write(articleId, STORE_SHARE_CODE_ARTICLE_ID);
+
+  log("Selected article shareUrl with code = " + fullShareUrl);
+
+  const reportUrl = H5_HOST + "/app/v1/task/shareReporting?shareCode=" + encodeURIComponent(shareCode);
+
+  const reportHeaders = {
+    "accept": "*/*",
+    "content-type": "application/json",
+    "origin": H5_HOST,
+    "referer": H5_HOST + "/",
+    "accept-language": "zh-CN,zh-Hans;q=0.9",
+    "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1"
+  };
+
+  const reportBody = {
+    businessNo: articleId,
+    eventData: {
+      firstClassification: "文章",
+      secondClassification: ""
+    }
+  };
+
+  log("shareReporting businessNo = " + articleId);
+  log("shareReporting shareCode = " + mask(shareCode, 12, 8));
+  log("Request shareReporting: " + reportUrl);
+
+  const reportRet = await request("POST", reportUrl, reportHeaders, reportBody);
+
+  log("shareReporting HTTP = " + reportRet.resp.status);
+  log("shareReporting body = " + String(reportRet.data || "").slice(0, 1000));
+
+  const reportObj = parseJsonSafe(reportRet.data);
+
+  const success =
+    Number(reportRet.resp.status) === 200 &&
+    String(reportObj.code || "") === "success" &&
+    String(reportObj.data || "").includes("上报成功");
+
+  if (success) {
+    saveUsedArticle(articleId);
+    notify("领克分享完成", articleId, title);
+    return true;
+  }
+
+  notify("领克分享失败", "HTTP " + reportRet.resp.status, String(reportRet.data || "").slice(0, 200));
+  return false;
 }
 
 /* =========================
- * Cron Main Logic
+ * Passive Capture
+ * ========================= */
+function isGetShareCodeUrl(url) {
+  const text = String(url || "");
+  return (
+    text.includes("/app/v1/task/getShareCode") &&
+    (
+      text.includes("app-services.lynkco.com.cn") ||
+      text.includes("app-api-gw-toc.lynkco.com")
+    )
+  );
+}
+
+function extractArticleIdFromRiskRequestInfo(headers) {
+  const raw = getHeader(headers, "risk_request_info");
+  if (!raw) return "";
+
+  try {
+    const info = JSON.parse(raw);
+    const url = String(info.shareContentURL || "");
+    const match = url.match(/[?&]id=([^&]+)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  } catch (e) {
+    const match = String(raw).match(/[?&]id=([^&"}]+)/);
+    return match ? decodeURIComponent(match[1]) : "";
+  }
+}
+
+function handleHttpRequest() {
+  const url = $request.url || "";
+  const headers = $request.headers || {};
+
+  log("HTTP_REQUEST URL = " + url);
+  log("SCRIPT_VERSION = " + SCRIPT_VERSION);
+
+  const token = getHeader(headers, "token");
+  const svcsid = getHeader(headers, "svcsid");
+  const deviceId =
+    getHeader(headers, "gl_dev_id") ||
+    getHeader(headers, "deviceId") ||
+    extractDeviceIdFromUrl(url);
+
+  if (token) {
+    write(token, STORE_TOKEN);
+    log("token saved = " + mask(token, 12, 8));
+  }
+
+  if (svcsid) {
+    write(svcsid, STORE_SVCSID);
+    log("svcsid saved = " + mask(svcsid, 12, 8));
+  }
+
+  if (deviceId) {
+    write(deviceId, STORE_DEVICE_ID);
+    log("deviceId saved = " + mask(deviceId, 8, 6));
+  }
+
+  if (token || svcsid || deviceId) {
+    notify("领克抓包成功", "token/svcsid/deviceId", "已更新本地缓存");
+  }
+
+  $done({});
+}
+
+function handleHttpResponse() {
+  const url = ($request && $request.url) || "";
+  const reqHeaders = ($request && $request.headers) || {};
+  const body = ($response && $response.body) || "";
+
+  log("HTTP_RESPONSE URL = " + url);
+  log("SCRIPT_VERSION = " + SCRIPT_VERSION);
+
+  const deviceId =
+    getHeader(reqHeaders, "gl_dev_id") ||
+    getHeader(reqHeaders, "deviceId") ||
+    extractDeviceIdFromUrl(url);
+
+  if (deviceId) {
+    write(deviceId, STORE_DEVICE_ID);
+    log("deviceId saved from response request = " + mask(deviceId, 8, 6));
+  }
+
+  const obj = parseJsonSafe(body);
+
+  if (url.includes("/auth/login/")) {
+    const refreshToken = extractTokenFromObject(obj);
+    const accessToken = extractAccessTokenFromObject(obj);
+
+    if (refreshToken) {
+      write(refreshToken, STORE_REFRESH_TOKEN);
+      log("refreshToken saved = " + mask(refreshToken, 12, 8));
+    }
+
+    if (accessToken) {
+      write(accessToken, STORE_ACCESS_TOKEN);
+      write(accessToken, STORE_TOKEN);
+      write(accessToken, STORE_SVCSID);
+      write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
+      log("accessToken saved = " + mask(accessToken, 12, 8));
+    }
+
+    if (refreshToken || accessToken || deviceId) {
+      notify("领克登录信息已保存", "refreshToken/deviceId", "后续可自动签到");
+    }
+
+    $done({});
+    return;
+  }
+
+  if (isGetShareCodeUrl(url)) {
+    const token = getHeader(reqHeaders, "token");
+    const svcsid = getHeader(reqHeaders, "svcsid");
+
+    if (token) {
+      write(token, STORE_TOKEN);
+      log("token saved from getShareCode = " + mask(token, 12, 8));
+    }
+
+    if (svcsid) {
+      write(svcsid, STORE_SVCSID);
+      log("svcsid saved from getShareCode = " + mask(svcsid, 12, 8));
+    }
+
+    log("getShareCode response body = " + String(body || "").slice(0, 1200));
+
+    const shareCode = extractShareCode(obj);
+    const articleId = extractArticleIdFromRiskRequestInfo(reqHeaders);
+
+    if (shareCode) {
+      saveShareCode(shareCode, "http-response", articleId);
+      notify("领克 shareCode 已保存", formatGmt8Day(Date.now()), mask(shareCode, 12, 8));
+    }
+
+    $done({});
+    return;
+  }
+
+  $done({});
+}
+
+/* =========================
+ * State Log
+ * ========================= */
+function logStoredState() {
+  log("Stored refreshToken = " + mask(read(STORE_REFRESH_TOKEN), 12, 8));
+  log("Stored deviceId = " + mask(read(STORE_DEVICE_ID), 8, 6));
+  log("Stored accessToken = " + mask(read(STORE_ACCESS_TOKEN), 12, 8));
+  log("Stored token = " + mask(read(STORE_TOKEN), 12, 8));
+  log("Stored svcsid = " + mask(read(STORE_SVCSID), 12, 8));
+  log("Stored shareCode = " + mask(read(STORE_SHARE_CODE), 12, 8));
+  log("Stored shareCode day = " + (read(STORE_SHARE_CODE_DAY) || "empty"));
+  log("Stored shareCode source = " + (read(STORE_SHARE_CODE_SOURCE) || "empty"));
+  log("Stored used ids = " + (read(STORE_USED_IDS) || "[]"));
+}
+
+/* =========================
+ * Cron Main
  * ========================= */
 async function runCron() {
-  log("LynkCo auto share start");
+  log("LynkCo sign + share start");
   log("SCRIPT_VERSION = " + SCRIPT_VERSION);
   logStoredState();
 
-  const token = read(STORE_TOKEN);
-  const svcsid = read(STORE_SVCSID);
-
-  log("token = " + (token ? "yes" : "empty"));
-  log("svcsid = " + (svcsid ? "yes" : "empty"));
-
-  if (!token && !svcsid) {
-    notify("LynkCo auto share failed", "Missing token", "打开领克 App 探索文章一次");
-    $done({});
-    return;
-  }
-
-  let shareCode = getTodayShareCode();
-
-  if (!shareCode) {
-    log("No cached shareCode today, try direct getShareCode API");
-    shareCode = await fetchShareCodeDirect();
-  }
-
-  if (!shareCode) {
-    notify("LynkCo auto share failed", "Missing shareCode", "主动 getShareCode 失败，请查看 Loon 日志");
-    $done({});
-    return;
-  }
-
   try {
-    const listPath = "/app/explore/home-page/v2/page/pull?pageNo=1&pageSize=10&articleTypes=";
-    const listUrl = H5_API_HOST + listPath;
+    const token = await getBusinessToken();
 
-    log("Request article list: " + listUrl);
-
-    const listRet = await request(
-      "GET",
-      listUrl,
-      buildH5SignedHeaders("GET", listPath)
-    );
-
-    log("Article list HTTP = " + listRet.resp.status);
-    log("Article list body = " + String(listRet.data || "").slice(0, 1000));
-
-    if (Number(listRet.resp.status) !== 200) {
-      notify("LynkCo auto share failed", "Article list HTTP " + listRet.resp.status, String(listRet.data || "{}").slice(0, 150));
+    if (!token) {
+      notify(
+        "领克任务失败",
+        "缺少 token",
+        "请打开领克 App 登录/探索页，让 Loon 抓 refreshToken/deviceId"
+      );
       $done({});
       return;
     }
 
-    const listObj = parseJsonSafe(listRet.data);
-    const list = extractArticleList(listObj);
+    log("Business token = " + mask(token, 12, 8));
 
-    log("Article list code = " + (listObj.code || ""));
-    log("Article list total = " + ((listObj.data && listObj.data.total) || ""));
-    log("Article list page = " + ((listObj.data && listObj.data.page) || ""));
-    log("Article list pageSize = " + ((listObj.data && listObj.data.pageSize) || ""));
+    await doDailySign(token);
+    await getSignInfo(token);
+    await getTaskList(token);
 
-    logArticleCandidates(list);
+    const shareCode = await fetchShareCodeDirect(token);
 
-    if (!list.length) {
-      notify("LynkCo auto share failed", "Empty article list", String(listRet.data || "{}").slice(0, 150));
+    if (!shareCode) {
+      notify("领克分享跳过", "shareCode 获取失败", "签到已尝试完成，请看日志");
       $done({});
       return;
     }
 
-    const article = pickArticle(list);
+    await doArticleShare(token, shareCode);
 
-    if (!article) {
-      notify("LynkCo auto share failed", "No available article", "");
-      $done({});
-      return;
-    }
-
-    const articleId = getArticleId(article);
-    const title = getTitle(article);
-
-    if (!articleId) {
-      notify("LynkCo auto share failed", "Cannot parse article ID", JSON.stringify(article).slice(0, 200));
-      $done({});
-      return;
-    }
-
-    log("Selected article raw = " + JSON.stringify(article).slice(0, 1000));
-    log("Selected article id = " + articleId);
-    log("Selected article title = " + title);
-    log("Selected article shareUrl base = " + buildShareUrl(articleId));
-
-    const detailPath = "/app/explore/home-page/article/content/" + articleId + "?typeCode=content";
-    const detailUrl = H5_API_HOST + detailPath;
-
-    log("Request article detail: " + detailUrl);
-
-    const detailRet = await request(
-      "GET",
-      detailUrl,
-      buildH5SignedHeaders("GET", detailPath)
-    );
-
-    log("Article detail HTTP = " + detailRet.resp.status);
-    log("Article detail body = " + String(detailRet.data || "").slice(0, 500));
-
-    const readPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ReadCount";
-    const readUrl = H5_API_HOST + readPath;
-
-    log("Request ReadCount: " + readUrl);
-
-    const readRet = await request(
-      "POST",
-      readUrl,
-      buildH5SignedHeaders("POST", readPath),
-      {}
-    );
-
-    log("ReadCount HTTP = " + readRet.resp.status);
-    log("ReadCount body = " + String(readRet.data || "").slice(0, 500));
-
-    const shareCountPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ShareCount";
-    const shareCountUrl = H5_API_HOST + shareCountPath;
-
-    log("Request ShareCount: " + shareCountUrl);
-
-    const shareCountRet = await request(
-      "POST",
-      shareCountUrl,
-      buildH5SignedHeaders("POST", shareCountPath),
-      {}
-    );
-
-    log("ShareCount HTTP = " + shareCountRet.resp.status);
-    log("ShareCount body = " + String(shareCountRet.data || "").slice(0, 500));
-
-    const fullShareUrl = buildShareUrlWithCode(articleId, shareCode);
-    write(fullShareUrl, STORE_SHARE_URL);
-
-    log("Selected article shareUrl with code = " + fullShareUrl);
-
-    const reportUrl = H5_HOST + "/app/v1/task/shareReporting?shareCode=" + encodeURIComponent(shareCode);
-
-    const reportHeaders = {
-      "accept": "*/*",
-      "content-type": "application/json",
-      "origin": H5_HOST,
-      "referer": H5_HOST + "/",
-      "accept-language": "zh-CN,zh-Hans;q=0.9",
-      "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.5 Mobile/15E148 Safari/604.1"
-    };
-
-    const reportBody = {
-      businessNo: articleId,
-      eventData: {
-        firstClassification: "文章",
-        secondClassification: ""
-      }
-    };
-
-    log("shareReporting businessNo = " + articleId);
-    log("shareReporting shareCode = " + mask(shareCode, 12, 8));
-    log("Request shareReporting: " + reportUrl);
-    log("shareReporting request body = " + JSON.stringify(reportBody));
-
-    const reportRet = await request(
-      "POST",
-      reportUrl,
-      reportHeaders,
-      reportBody
-    );
-
-    log("shareReporting HTTP = " + reportRet.resp.status);
-    log("shareReporting body = " + String(reportRet.data || "").slice(0, 800));
-
-    const reportObj = parseJsonSafe(reportRet.data);
-
-    const reportCode = reportObj.code || "";
-    const reportData = reportObj.data || "";
-    const reportMessage = reportObj.message || "";
-
-    log("shareReporting code = " + reportCode);
-    log("shareReporting data = " + reportData);
-    log("shareReporting message = " + reportMessage);
-
-    const reportSuccess =
-      Number(reportRet.resp.status) === 200 &&
-      reportCode === "success" &&
-      String(reportData).includes("上报成功");
-
-    if (reportSuccess) {
-      saveUsedArticle(articleId);
-      notify("LynkCo auto share done", articleId, title);
-    } else {
-      log("shareReporting not completed, do not save used article id");
-
-      if (String(reportData).includes("验证码失效")) {
-        notify("LynkCo auto share failed", "shareCode expired", "脚本会下次重新 getShareCode，也可手动点分享刷新");
-      } else {
-        notify("LynkCo auto share failed", "HTTP " + reportRet.resp.status, String(reportRet.data || "").slice(0, 200));
-      }
-    }
-
-    log("LynkCo auto share end");
+    log("LynkCo sign + share end");
     $done({});
   } catch (e) {
-    log("Script error: " + e);
-    notify("LynkCo auto share error", "", String(e));
+    log("Cron error = " + e);
+    notify("领克脚本异常", "", String(e));
     $done({});
   }
 }

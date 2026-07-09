@@ -1057,8 +1057,12 @@ function handleHttpResponse() {
       log("accessToken saved from auth response = " + mask(accessToken, 12, 8));
     }
 
-    if (refreshToken || accessToken || deviceId) {
-      notify("领克登录信息已保存", "refreshToken/deviceId", "后续可自动签到");
+    if (refreshToken || accessToken) {
+      notify("领克登录信息已保存", "refreshToken/accessToken", "后续可自动签到");
+    } else if (deviceId) {
+      notify("领克 deviceId 已保存", "还缺 refreshToken", "需要抓到 mobileCodeLogin 或 refresh 响应");
+    } else {
+      log("auth response has no refreshToken/accessToken/deviceId");
     }
 
     $done({});

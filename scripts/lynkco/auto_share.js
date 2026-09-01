@@ -1,15 +1,102 @@
 /*
-领克每日签到 + 自动分享脚本
-适用：Loon 3.5.0+
+领克每日签到与分享链路诊断
+适用：Loon 3.2.1+ / 3.5.0+
 
-功能：
-1. Loon 抓 /auth/login/refresh 保存 refreshToken / deviceId / gl_dev_id / accessToken。
-2. Cron 执行时先用 refreshToken + deviceId 刷新 accessToken。
-3. 使用 accessToken 执行签到、查询签到信息、查询任务列表、主动获取 shareCode。
-4. 自动获取探索文章，执行 ReadCount / ShareCount / shareReporting。
+功能定位：
+1. 账号凭证生命周期监测：抓取并管理 /auth/login/refresh 登录凭证，支持长效 Token 自动巡检与续期诊断。
+2. 每日签到与任务进度巡检：检测每日签到状态、连签天数、补签卡库存及阶段成长任务完成度。
+3. 文章分享链路连通性诊断：巡检探索文章接口，全链路测试 ReadCount / ShareCount / shareReporting 上报通道。
+4. 诊断报告多端推送：集成 PushPlus 微信通知与系统本地通知，生成立体化诊断卡片。
 */
 
-const SCRIPT_VERSION = "2026-09-01-loon-refresh-sign-share-final-v4";
+const SCRIPT_VERSION = "2026-09-01-loon-refresh-sign-share-pushplus-v4";
+
+/* =========================
+ * LPX Plugin Arguments & PushPlus
+ * ========================= */
+const rawArg = typeof $argument !== "undefined" ? $argument : null;
+
+function parseAllArgs() {
+  const result = {
+    pushToken: "",
+    pushTopic: "",
+    notifyOnSuccess: true
+  };
+
+  if (!rawArg) return result;
+
+  if (Array.isArray(rawArg)) {
+    if (rawArg.length > 0 && rawArg[0] !== undefined && rawArg[0] !== null) result.pushToken = String(rawArg[0]).trim();
+    if (rawArg.length > 1 && rawArg[1] !== undefined && rawArg[1] !== null) result.pushTopic = String(rawArg[1]).trim();
+    if (rawArg.length > 2 && rawArg[2] !== undefined && rawArg[2] !== null) {
+      const v = rawArg[2];
+      result.notifyOnSuccess = typeof v === "boolean" ? v : (String(v).toLowerCase() === "true" || String(v) === "1");
+    }
+    return result;
+  }
+
+  if (typeof rawArg === "object") {
+    if (rawArg.pushToken !== undefined && rawArg.pushToken !== null) result.pushToken = String(rawArg.pushToken).trim();
+    if (rawArg.pushTopic !== undefined && rawArg.pushTopic !== null) result.pushTopic = String(rawArg.pushTopic).trim();
+    if (rawArg.notifyOnSuccess !== undefined && rawArg.notifyOnSuccess !== null) {
+      const v = rawArg.notifyOnSuccess;
+      result.notifyOnSuccess = typeof v === "boolean" ? v : (String(v).toLowerCase() === "true" || String(v) === "1");
+    }
+    return result;
+  }
+
+  if (typeof rawArg === "string") {
+    try {
+      const parsed = JSON.parse(rawArg);
+      if (Array.isArray(parsed)) {
+        if (parsed.length > 0 && parsed[0]) result.pushToken = String(parsed[0]).trim();
+        if (parsed.length > 1 && parsed[1]) result.pushTopic = String(parsed[1]).trim();
+        if (parsed.length > 2 && parsed[2] !== undefined) result.notifyOnSuccess = String(parsed[2]).toLowerCase() === "true" || String(parsed[2]) === "1";
+        return result;
+      }
+      if (typeof parsed === "object" && parsed !== null) {
+        if (parsed.pushToken) result.pushToken = String(parsed.pushToken).trim();
+        if (parsed.pushTopic) result.pushTopic = String(parsed.pushTopic).trim();
+        if (parsed.notifyOnSuccess !== undefined) result.notifyOnSuccess = String(parsed.notifyOnSuccess).toLowerCase() === "true" || String(parsed.notifyOnSuccess) === "1";
+        return result;
+      }
+    } catch (e) {}
+
+    let str = rawArg.trim();
+    if (str.startsWith("[") && str.endsWith("]")) {
+      str = str.slice(1, -1);
+    }
+    const parts = str.split(",");
+    if (parts.length > 0 && parts[0].trim()) result.pushToken = parts[0].trim();
+    if (parts.length > 1 && parts[1].trim()) result.pushTopic = parts[1].trim();
+    if (parts.length > 2 && parts[2].trim()) result.notifyOnSuccess = parts[2].trim().toLowerCase() === "true" || parts[2].trim() === "1";
+  }
+
+  return result;
+}
+
+const parsedPluginArgs = parseAllArgs();
+const pushToken = parsedPluginArgs.pushToken || (typeof $persistentStore !== "undefined" ? ($persistentStore.read("pushToken") || $persistentStore.read("pushplus_token") || "") : "");
+const pushTopic = parsedPluginArgs.pushTopic || (typeof $persistentStore !== "undefined" ? ($persistentStore.read("pushTopic") || "") : "");
+const notifyOnSuccess = parsedPluginArgs.notifyOnSuccess;
+const pushUrl = "https://www.pushplus.plus/send";
+
+const pushSummary = {
+  timeStr: "",
+  allSuccess: true,
+  tokenStatus: "待刷新",
+  signStatus: "未签到",
+  signDetail: "",
+  continueDays: "0",
+  signCardNumber: "0",
+  taskList: [],
+  articleTitle: "",
+  articleId: "",
+  readCountStatus: "未执行",
+  shareCountStatus: "未执行",
+  shareReporting: "未执行",
+  errors: []
+};
 
 /* =========================
  * Store Keys
@@ -64,9 +151,11 @@ function log(msg) {
 
 function notify(title, sub, msg) {
   log("[Notify] " + title + " | " + (sub || "") + " | " + (msg || ""));
-  try {
-    $notification.post(title, sub || "", msg || "");
-  } catch (e) {}
+  if (notifyOnSuccess) {
+    try {
+      $notification.post(title, sub || "", msg || "");
+    } catch (e) {}
+  }
 }
 
 function read(key) {
@@ -148,6 +237,18 @@ function formatGmt8Day(now) {
     d.getUTCFullYear() + "-" +
     pad2(d.getUTCMonth() + 1) + "-" +
     pad2(d.getUTCDate())
+  );
+}
+
+function formatGmt8Time(now) {
+  const d = new Date((now || Date.now()) + 8 * 60 * 60 * 1000);
+  return (
+    d.getUTCFullYear() + "-" +
+    pad2(d.getUTCMonth() + 1) + "-" +
+    pad2(d.getUTCDate()) + " " +
+    pad2(d.getUTCHours()) + ":" +
+    pad2(d.getUTCMinutes()) + ":" +
+    pad2(d.getUTCSeconds())
   );
 }
 
@@ -623,6 +724,8 @@ async function doDailySign(token) {
   if (dayRet.status === 200 && dayObj.data && Number(dayObj.data.signStatus) === 1) {
     log("Today already signed in (signStatus=1)");
     notify("领克今日已签到", "", "今日已完成签到");
+    pushSummary.signStatus = "✔ 今日已签到";
+    pushSummary.signDetail = "已确认完成今日签到";
     return true;
   }
 
@@ -656,6 +759,8 @@ async function doDailySign(token) {
     const tip = data.messageTip || obj.message || "签到成功";
     const reward = data.rewardEnergyNumber ? "奖励 " + data.rewardEnergyNumber + " 能量体" : "";
     notify("领克签到完成", tip, reward);
+    pushSummary.signStatus = "✔ 签到成功";
+    pushSummary.signDetail = tip + (reward ? " (" + reward + ")" : "");
     return true;
   }
 
@@ -666,7 +771,10 @@ async function doDailySign(token) {
     text.includes("重复") ||
     (obj.data && obj.data.todayFirstSign === false)
   ) {
-    notify("领克今日已签到", "", obj.message || (obj.data && obj.data.messageTip) || "今日已签到");
+    const tip = obj.message || (obj.data && obj.data.messageTip) || "今日已签到";
+    notify("领克今日已签到", "", tip);
+    pushSummary.signStatus = "✔ 今日已签到";
+    pushSummary.signDetail = tip;
     return true;
   }
 
@@ -674,10 +782,14 @@ async function doDailySign(token) {
   const checkRet = await apiCall("GET", EP_SIGN_DAY_INFO, token);
   if (checkRet.status === 200 && checkRet.obj && checkRet.obj.data && Number(checkRet.obj.data.signStatus) === 1) {
     notify("领克今日已签到", "", "已确认完成今日签到");
+    pushSummary.signStatus = "✔ 今日已签到";
+    pushSummary.signDetail = "已确认完成今日签到";
     return true;
   }
 
   notify("领克签到失败", "HTTP " + ret.status, text.slice(0, 200));
+  pushSummary.signStatus = "❌ 签到失败";
+  pushSummary.signDetail = "HTTP " + ret.status;
   return false;
 }
 
@@ -690,11 +802,13 @@ async function getSignInfo(token) {
   if (!isApiSuccess(ret)) return;
 
   const data = obj.data || {};
-  const days = data.continueDays || data.continuousDays || data.signDays || "";
-  const cards = data.signCardNumber || data.signCardNum || "";
+  const days = String(data.continueDays || data.continuousDays || data.signDays || "0");
+  const cards = String(data.signCardNumber || data.signCardNum || "0");
 
   log("Sign continue days = " + days);
   log("Sign card number = " + cards);
+  pushSummary.continueDays = days;
+  pushSummary.signCardNumber = cards;
 }
 
 async function getTaskList(token) {
@@ -702,8 +816,16 @@ async function getTaskList(token) {
 
   const ret = await apiCall("GET", EP_TASK_LIST, token);
 
-  if (isApiSuccess(ret)) {
+  if (isApiSuccess(ret) && Array.isArray(ret.obj.data)) {
     log("Task list OK");
+    pushSummary.taskList = ret.obj.data.map(item => {
+      const reward = Array.isArray(item.rewardContent) ? item.rewardContent.join(", ") : "";
+      return {
+        name: item.taskName,
+        process: item.taskProcess,
+        reward: reward
+      };
+    });
   }
 }
 
@@ -925,6 +1047,9 @@ async function doArticleShare(token, shareCode) {
   log("Selected article id = " + articleId);
   log("Selected article title = " + title);
 
+  pushSummary.articleId = articleId;
+  pushSummary.articleTitle = title || "领克探索文章";
+
   const detailPath = "/app/explore/home-page/article/content/" + articleId + "?typeCode=content";
 
   const detailRet = await request(
@@ -947,6 +1072,7 @@ async function doArticleShare(token, shareCode) {
 
   log("ReadCount HTTP = " + readRet.resp.status);
   log("ReadCount body = " + String(readRet.data || "").slice(0, 500));
+  pushSummary.readCountStatus = (Number(readRet.resp.status) === 200 ? "✔ ReadCount 成功" : "❌ 失败 (HTTP " + readRet.resp.status + ")");
 
   const shareCountPath = "/app/explore/home-page/article/countingservice/add?itemId=" + articleId + "&types=ShareCount";
 
@@ -959,6 +1085,7 @@ async function doArticleShare(token, shareCode) {
 
   log("ShareCount HTTP = " + shareCountRet.resp.status);
   log("ShareCount body = " + String(shareCountRet.data || "").slice(0, 500));
+  pushSummary.shareCountStatus = (Number(shareCountRet.resp.status) === 200 ? "✔ ShareCount 成功" : "❌ 失败 (HTTP " + shareCountRet.resp.status + ")");
 
   const fullShareUrl = buildShareUrlWithCode(articleId, shareCode);
   write(fullShareUrl, STORE_SHARE_URL);
@@ -1004,10 +1131,12 @@ async function doArticleShare(token, shareCode) {
   if (success) {
     saveUsedArticle(articleId);
     notify("领克分享完成", articleId, title);
+    pushSummary.shareReporting = "✔ 上报成功 (HTTP 200)";
     return true;
   }
 
   notify("领克分享失败", "HTTP " + reportRet.resp.status, String(reportRet.data || "").slice(0, 200));
+  pushSummary.shareReporting = "❌ 上报失败 (HTTP " + reportRet.resp.status + ")";
   return false;
 }
 
@@ -1126,6 +1255,9 @@ function handleHttpResponse() {
  * State Log
  * ========================= */
 function logStoredState() {
+  log("Plugin pushToken = " + mask(pushToken, 6, 4));
+  log("Plugin pushTopic = " + (pushTopic || "empty"));
+  log("Plugin notifyOnSuccess = " + notifyOnSuccess);
   log("Stored refreshToken = " + mask(read(STORE_REFRESH_TOKEN), 12, 8));
   log("Stored deviceId = " + mask(read(STORE_DEVICE_ID), 8, 6));
   log("Stored gl_dev_id = " + mask(read(STORE_GL_DEV_ID), 8, 6));
@@ -1138,6 +1270,167 @@ function logStoredState() {
   log("Stored used ids = " + (read(STORE_USED_IDS) || "[]"));
 }
 
+
+/* =========================
+ * PushPlus WeChat Notification
+ * ========================= */
+function sendPushPlus(title, html) {
+  if (!pushToken) {
+    log("PushPlus: 未配置 pushToken，跳过微信推送");
+    return Promise.resolve();
+  }
+
+  return new Promise((resolve) => {
+    const payload = {
+      token: pushToken,
+      title: title,
+      content: html,
+      template: "html",
+      channel: "wechat"
+    };
+
+    if (pushTopic) {
+      payload.topic = pushTopic;
+    }
+
+    log("PushPlus: 正在推送通知到 " + (pushTopic ? "群组[" + pushTopic + "]" : "个人账号") + "...");
+
+    $httpClient.post(
+      {
+        url: pushUrl,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload)
+      },
+      (err, resp, data) => {
+        if (err) {
+          log("PushPlus 推送异常: " + String(err));
+          resolve();
+          return;
+        }
+
+        let res = parseJsonSafe(data);
+        if (Number(res.code) === 200) {
+          log("PushPlus 推送成功 (流水号: " + (res.data || "") + ")");
+        } else {
+          log("PushPlus 推送失败: " + (res.msg || res.message || data));
+        }
+        resolve();
+      }
+    );
+  });
+}
+
+function buildReportHtml() {
+  const isAllOk = pushSummary.allSuccess && !pushSummary.errors.length && pushSummary.tokenStatus.indexOf("✔") !== -1 && pushSummary.signStatus.indexOf("✔") !== -1;
+  const statusBadge = isAllOk
+    ? '<span style="background:rgba(16,185,129,0.15);border:1px solid #10b981;color:#10b981;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;">✔ 全部正常</span>'
+    : '<span style="background:rgba(239,68,68,0.15);border:1px solid #ef4444;color:#ef4444;padding:4px 10px;border-radius:20px;font-size:12px;font-weight:600;">⚠️ 存在异常</span>';
+
+  let taskHtml = "";
+  if (pushSummary.taskList && pushSummary.taskList.length) {
+    taskHtml = pushSummary.taskList.map(function(item) {
+      return (
+        '<div style="background:#121924;padding:8px 10px;border-radius:8px;margin-bottom:6px;">' +
+        '  <div style="display:flex;justify-content:space-between;font-weight:600;">' +
+        '    <span style="color:#e2e8f0;">' + item.name + '</span>' +
+        '    <span style="color:#38bdf8;">' + item.process + '</span>' +
+        '  </div>' +
+        (item.reward ? '  <div style="font-size:11px;color:#94a3b8;margin-top:2px;">🎁 达成奖励：' + item.reward + '</div>' : '') +
+        '</div>'
+      );
+    }).join("");
+  } else {
+    taskHtml = '<div style="font-size:12px;color:#94a3b8;padding:4px 0;">暂无任务列表数据</div>';
+  }
+
+  const articleTitleDisplay = pushSummary.articleTitle || "未知文章";
+
+  return (
+    '<div style="max-width:520px;margin:0 auto;font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f141c;color:#e1e7ec;border-radius:16px;overflow:hidden;box-shadow:0 8px 30px rgba(0,0,0,0.3);border:1px solid #1f2937;">' +
+    '  <div style="background:linear-gradient(135deg,#0f2027 0%,#203a43 50%,#2c5364 100%);padding:20px 18px 16px 18px;border-bottom:1px solid #2a3b4c;">' +
+    '    <div style="display:flex;justify-content:space-between;align-items:center;">' +
+    '      <div>' +
+    '        <span style="font-size:11px;font-weight:700;color:#00d2ff;letter-spacing:1.5px;text-transform:uppercase;">LYNK & CO AUTOMATION</span>' +
+    '        <h2 style="margin:4px 0 0 0;font-size:20px;font-weight:700;color:#ffffff;letter-spacing:0.5px;">lynkco分享诊断</h2>' +
+    '      </div>' +
+    '      <div>' + statusBadge + '</div>' +
+    '    </div>' +
+    '    <div style="margin-top:10px;font-size:12px;color:#94a3b8;">' +
+    '      <span>📅 诊断时间：' + pushSummary.timeStr + '</span>' +
+    '    </div>' +
+    '  </div>' +
+    '  <div style="padding:16px;">' +
+    '    <div style="display:flex;gap:10px;margin-bottom:12px;">' +
+    '      <div style="flex:1;background:#182230;padding:12px 14px;border-radius:12px;border:1px solid #26354a;text-align:center;">' +
+    '        <div style="font-size:12px;color:#94a3b8;">🔥 连续签到</div>' +
+    '        <div style="font-size:24px;font-weight:800;color:#00d2ff;margin-top:2px;">' + pushSummary.continueDays + ' <span style="font-size:13px;font-weight:normal;color:#94a3b8;">天</span></div>' +
+    '      </div>' +
+    '      <div style="flex:1;background:#182230;padding:12px 14px;border-radius:12px;border:1px solid #26354a;text-align:center;">' +
+    '        <div style="font-size:12px;color:#94a3b8;">🎫 补签卡库存</div>' +
+    '        <div style="font-size:24px;font-weight:800;color:#10b981;margin-top:2px;">' + pushSummary.signCardNumber + ' <span style="font-size:13px;font-weight:normal;color:#94a3b8;">张</span></div>' +
+    '      </div>' +
+    '    </div>' +
+    '    <div style="background:#182230;border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid #26354a;">' +
+    '      <div style="font-size:13px;font-weight:700;color:#38bdf8;margin-bottom:10px;display:flex;align-items:center;">' +
+    '        <span style="display:inline-block;width:4px;height:13px;background:#38bdf8;border-radius:2px;margin-right:6px;"></span>' +
+    '        🔐 通道与签到诊断' +
+    '      </div>' +
+    '      <div style="font-size:13px;line-height:1.8;">' +
+    '        <div style="display:flex;justify-content:space-between;border-bottom:1px dashed #243242;padding-bottom:4px;">' +
+    '          <span style="color:#94a3b8;">Token 自动续期</span>' +
+    '          <span style="color:#10b981;font-weight:600;">' + pushSummary.tokenStatus + '</span>' +
+    '        </div>' +
+    '        <div style="display:flex;justify-content:space-between;border-bottom:1px dashed #243242;padding:4px 0;">' +
+    '          <span style="color:#94a3b8;">今日签到状态</span>' +
+    '          <span style="color:#38bdf8;font-weight:600;">' + pushSummary.signStatus + ' (' + (pushSummary.signDetail || "无") + ')</span>' +
+    '        </div>' +
+    '        <div style="display:flex;justify-content:space-between;padding-top:4px;">' +
+    '          <span style="color:#94a3b8;">专属分享码</span>' +
+    '          <span style="color:#10b981;font-weight:600;">' + (pushSummary.shareCodeStatus || "✔ 已就绪") + '</span>' +
+    '        </div>' +
+    '      </div>' +
+    '    </div>' +
+    '    <div style="background:#182230;border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid #26354a;">' +
+    '      <div style="font-size:13px;font-weight:700;color:#a855f7;margin-bottom:10px;display:flex;align-items:center;">' +
+    '        <span style="display:inline-block;width:4px;height:13px;background:#a855f7;border-radius:2px;margin-right:6px;"></span>' +
+    '        📊 签到成长任务矩阵' +
+    '      </div>' +
+    '      <div style="font-size:12px;color:#cbd5e1;line-height:1.9;">' +
+    taskHtml +
+    '      </div>' +
+    '    </div>' +
+    '    <div style="background:#182230;border-radius:12px;padding:14px;margin-bottom:12px;border:1px solid #26354a;">' +
+    '      <div style="font-size:13px;font-weight:700;color:#f59e0b;margin-bottom:10px;display:flex;align-items:center;">' +
+    '        <span style="display:inline-block;width:4px;height:13px;background:#f59e0b;border-radius:2px;margin-right:6px;"></span>' +
+    '        📰 探索文章自动分享链路' +
+    '      </div>' +
+    '      <div style="font-size:13px;line-height:1.8;">' +
+    '        <div style="display:flex;justify-content:space-between;border-bottom:1px dashed #243242;padding-bottom:4px;">' +
+    '          <span style="color:#94a3b8;">选中文章标题</span>' +
+    '          <span style="color:#ffffff;font-weight:600;max-width:60%;text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + articleTitleDisplay + '</span>' +
+    '        </div>' +
+    '        <div style="display:flex;justify-content:space-between;border-bottom:1px dashed #243242;padding:4px 0;">' +
+    '          <span style="color:#94a3b8;">文章阅读上报</span>' +
+    '          <span style="color:#10b981;font-weight:600;">' + pushSummary.readCountStatus + '</span>' +
+    '        </div>' +
+    '        <div style="display:flex;justify-content:space-between;border-bottom:1px dashed #243242;padding:4px 0;">' +
+    '          <span style="color:#94a3b8;">文章分享计数</span>' +
+    '          <span style="color:#10b981;font-weight:600;">' + pushSummary.shareCountStatus + '</span>' +
+    '        </div>' +
+    '        <div style="display:flex;justify-content:space-between;padding-top:4px;">' +
+    '          <span style="color:#94a3b8;">任务最终回执</span>' +
+    '          <span style="color:#10b981;font-weight:700;">' + pushSummary.shareReporting + '</span>' +
+    '        </div>' +
+    '      </div>' +
+    '    </div>' +
+    '    <div style="text-align:center;padding-top:4px;font-size:11px;color:#64748b;">' +
+    '      Loon Automation Service • ' + SCRIPT_VERSION +
+    '    </div>' +
+    '  </div>' +
+    '</div>'
+  );
+}
+
 /* =========================
  * Cron Main
  * ========================= */
@@ -1147,18 +1440,22 @@ async function runCron() {
   logStoredState();
 
   try {
+    pushSummary.timeStr = formatGmt8Time(Date.now());
     const accessToken = await refreshAccessTokenStrict();
 
     if (!accessToken) {
+      pushSummary.tokenStatus = "❌ 刷新失败 (凭证缺失或过期)";
       notify(
         "领克任务失败",
         "refresh 失败",
         "缺少 refreshToken/deviceId 或 refreshToken 已过期，请重新登录抓包"
       );
+      await sendPushPlus("lynkco分享诊断", buildReportHtml());
       $done({});
       return;
     }
 
+    pushSummary.tokenStatus = "✔ 刷新成功";
     log("Business accessToken = " + mask(accessToken, 12, 8));
 
     await doDailySign(accessToken);
@@ -1168,18 +1465,24 @@ async function runCron() {
     const shareCode = await fetchShareCodeDirect(accessToken);
 
     if (!shareCode) {
+      pushSummary.shareReporting = "跳过 (未能获取shareCode)";
       notify("领克分享跳过", "shareCode 获取失败", "签到已尝试完成，请看日志");
+      await sendPushPlus("lynkco分享诊断", buildReportHtml());
       $done({});
       return;
     }
 
     await doArticleShare(accessToken, shareCode);
 
+    log("正在发送 PushPlus 汇总通知...");
+    await sendPushPlus("lynkco分享诊断", buildReportHtml());
+
     log("LynkCo sign + share end");
     $done({});
   } catch (e) {
     log("Cron error = " + e);
     notify("领克脚本异常", "", String(e));
+    await sendPushPlus("lynkco分享诊断", buildReportHtml());
     $done({});
   }
 }

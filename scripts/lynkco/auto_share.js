@@ -9,7 +9,7 @@
 4. 自动获取探索文章，执行 ReadCount / ShareCount / shareReporting。
 */
 
-const SCRIPT_VERSION = "2026-07-09-loon-refresh-sign-share-final-v3";
+const SCRIPT_VERSION = "2026-09-01-loon-refresh-sign-share-final-v4";
 
 /* =========================
  * Store Keys
@@ -44,11 +44,13 @@ const H5_HOST = "https://h5.lynkco.com";
 const APP_API_GW_HOST = "https://app-api-gw-toc.lynkco.com";
 const OAUTH_HOST = "https://app-services.lynkco.com.cn";
 
-const APP_VERSION = "4.2.3";
-const APP_BUILD = "40203073";
+const APP_VERSION = "4.2.6";
+const APP_BUILD = "40206033";
 
 const EP_REFRESH = "/auth/login/refresh";
-const EP_DAILY_SIGN = "/up/api/v1/user/sign";
+const EP_DAILY_SIGN = "/up/api/v1/user/sign/upgrade";
+const EP_SIGN_DAY_INFO = "/up/api/v1/user/sign/day/info";
+const EP_SIGN_CALENDAR = "/up/api/v1/user/sign/sign/info";
 const EP_SIGN_INFO = "/up/api/v1/userReward/getContinueDaysAndSignCard";
 const EP_TASK_LIST = "/up/api/v1/userReward/getTaskList";
 const EP_GET_SHARE_CODE = "/app/v1/task/getShareCode";
@@ -615,10 +617,28 @@ async function apiCall(method, pathWithQuery, token, body) {
 async function doDailySign(token) {
   log("Daily sign start");
 
+  // 1. 先查询今日签到状态
+  const dayRet = await apiCall("GET", EP_SIGN_DAY_INFO, token);
+  const dayObj = dayRet.obj || {};
+  if (dayRet.status === 200 && dayObj.data && Number(dayObj.data.signStatus) === 1) {
+    log("Today already signed in (signStatus=1)");
+    notify("领克今日已签到", "", "今日已完成签到");
+    return true;
+  }
+
+  // 2. 执行签到
+  log("Executing sign request: " + EP_DAILY_SIGN);
   const ret = await apiCall("POST", EP_DAILY_SIGN, token, {});
   const obj = ret.obj || {};
   const code = String(obj.code || "");
   const text = JSON.stringify(obj);
+
+  // 3. 同步日历
+  try {
+    const nowTs = Date.now();
+    const calBody = { startDate: nowTs - 5 * 86400000, endDate: nowTs + 30 * 86400000 };
+    await apiCall("POST", EP_SIGN_CALENDAR, token, calBody);
+  } catch (e) {}
 
   const signSuccess =
     ret.status === 200 &&
@@ -627,7 +647,8 @@ async function doDailySign(token) {
       code === "200" ||
       obj.success === true ||
       text.includes("签到成功") ||
-      text.includes("操作成功")
+      text.includes("操作成功") ||
+      (obj.data && obj.data.todayFirstSign === true)
     );
 
   if (signSuccess) {
@@ -642,9 +663,17 @@ async function doDailySign(token) {
     text.includes("已签到") ||
     text.includes("已经签到") ||
     text.includes("今日已") ||
-    text.includes("重复")
+    text.includes("重复") ||
+    (obj.data && obj.data.todayFirstSign === false)
   ) {
-    notify("领克今日已签到", "", obj.message || text.slice(0, 120));
+    notify("领克今日已签到", "", obj.message || (obj.data && obj.data.messageTip) || "今日已签到");
+    return true;
+  }
+
+  // 4. 二次复查 signStatus
+  const checkRet = await apiCall("GET", EP_SIGN_DAY_INFO, token);
+  if (checkRet.status === 200 && checkRet.obj && checkRet.obj.data && Number(checkRet.obj.data.signStatus) === 1) {
+    notify("领克今日已签到", "", "已确认完成今日签到");
     return true;
   }
 

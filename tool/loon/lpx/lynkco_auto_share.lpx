@@ -1,5 +1,5 @@
 #!name=领克每日签到与分享诊断
-#!desc=领克账号凭证生命周期巡检、每日签到状态检测、文章分享链路连通性诊断，支持 PushPlus 微信推送
+#!desc=打开领克App秒自动签到+自动捕获Token，定时自动分享+PushPlus推送
 #!author=swsv
 #!homepage=https://github.com/swsv/network-toolkit
 #!system=iOS,iPadOS,macOS
@@ -12,11 +12,14 @@ pushTopic = input,"",tag=PushPlus 群组(可选),desc=群组编码(若填则推�
 notifyOnSuccess = switch,true,tag=Loon 本地通知,desc=诊断任务执行完成后是否弹出系统本地通知
 
 [Script]
-http-request ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/(refresh|mobileCodeLogin|onekey\/mobileLogin|login) script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=30, tag=领克抓LoginRequest, enable=true
+# 1. 打开 App 秒自动注入原生签到逻辑
+http-response ^https:\/\/app\.lynkco\.com\/lynkco3-cordova\/(index\.html|static\/js\/pages-sign-index\..*\.js) script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=10, tag=领克注入自动签到, enable=true
 
-http-response ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/(refresh|mobileCodeLogin|onekey\/mobileLogin|login) script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓LoginResponse, enable=true
+# 2. 进入 App 自动捕获活跃 Token
+http-request ^https:\/\/app-api-gw-toc\.lynkco\.com\/up\/api\/v1\/(user\/sign|userReward) script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=10, tag=领克捕获Token, enable=true
 
-cron "26 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=90, tag=领克每日签到与分享诊断, argument=[{pushToken},{pushTopic},{notifyOnSuccess}], enable=true
+# 3. 定时巡检与分享上报任务
+cron "23 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=90, tag=领克每日签到与分享诊断, argument=[{pushToken},{pushTopic},{notifyOnSuccess}], enable=true
 
 [MITM]
-hostname = h5-api.lynkco.com, h5.lynkco.com, app-services.lynkco.com.cn, app-api-gw-toc.lynkco.com
+hostname = app.lynkco.com, app-api-gw-toc.lynkco.com, h5-api.lynkco.com

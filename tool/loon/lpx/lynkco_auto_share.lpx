@@ -16,7 +16,7 @@ http-request ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/(login\/.*|oauth2\/
 
 http-response ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/(login\/.*|oauth2\/.*) script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓LoginResponse, enable=true
 
-cron "23 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=90, tag=领克每日签到与分享诊断, argument=[{pushToken},{pushTopic},{notifyOnSuccess}], enable=true
+cron "26 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=90, tag=领克每日签到与分享诊断, argument=[{pushToken},{pushTopic},{notifyOnSuccess}], enable=true
 
 [MITM]
 hostname = h5-api.lynkco.com, h5.lynkco.com, app-services.lynkco.com.cn, app-api-gw-toc.lynkco.com

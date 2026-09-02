@@ -341,8 +341,8 @@ function extractDeviceInfoFromUrlOrHeaders(url, headers) {
     "";
 
   return {
-    deviceId: queryDeviceId || headerDeviceId || glDevId || "",
-    glDevId: glDevId || headerDeviceId || queryDeviceId || ""
+    deviceId: queryDeviceId || headerDeviceId || "",
+    glDevId: glDevId || ""
   };
 }
 
@@ -1188,8 +1188,10 @@ function handleHttpRequest() {
     log("refreshToken saved from request = " + mask(refreshToken, 12, 8));
   }
 
-  if (token || svcsid || deviceInfo.deviceId || deviceInfo.glDevId || refreshToken) {
-    notify("领克抓包成功", "refreshToken/deviceId 已更新", "后续可自动签到分享");
+  if (refreshToken) {
+    notify("领克长效凭证已更新", "已保存 refreshToken", "支持长效全自动续期");
+  } else if (token || svcsid) {
+    notify("领克活跃 Token 已更新", "已捕获 accessToken", "可用于执行今日签到与分享");
   }
 
   $done({});
@@ -1244,8 +1246,10 @@ function handleHttpResponse() {
     log("accessToken saved from response body = " + mask(accessToken, 12, 8));
   }
 
-  if (refreshTokenFromUrl || refreshToken || accessToken || deviceInfo.deviceId || deviceInfo.glDevId) {
-    notify("领克登录信息已保存", "refreshToken/deviceId", "后续可自动签到分享");
+  if (refreshTokenFromUrl || refreshToken) {
+    notify("领克长效凭证已更新", "已保存 refreshToken", "支持长效全自动续期");
+  } else if (accessToken) {
+    notify("领克活跃 Token 已更新", "已捕获 accessToken", "可用于执行今日签到与分享");
   }
 
   $done({});
@@ -1441,21 +1445,29 @@ async function runCron() {
 
   try {
     pushSummary.timeStr = formatGmt8Time(Date.now());
-    const accessToken = await refreshAccessTokenStrict();
+    let accessToken = await refreshAccessTokenStrict();
 
-    if (!accessToken) {
-      pushSummary.tokenStatus = "❌ 刷新失败 (凭证缺失或过期)";
-      notify(
-        "领克任务失败",
-        "refresh 失败",
-        "缺少 refreshToken/deviceId 或 refreshToken 已过期，请重新登录抓包"
-      );
-      await sendPushPlus("lynkco分享诊断", buildReportHtml());
-      $done({});
-      return;
+    if (accessToken) {
+      pushSummary.tokenStatus = "✔ 自动续期成功";
+    } else {
+      // 容错回退：尝试读取已捕获的活跃 Token
+      const fallbackToken = read(STORE_ACCESS_TOKEN) || read(STORE_TOKEN) || read(STORE_SVCSID) || "";
+      if (fallbackToken) {
+        log("Refresh 失败，但检测到已捕获的活跃 Token: " + mask(fallbackToken, 12, 8));
+        accessToken = fallbackToken;
+        pushSummary.tokenStatus = "⚡ 活跃Token直连 (需在App重新登录以获取长效RefreshToken)";
+      } else {
+        pushSummary.tokenStatus = "❌ 凭证缺失或过期";
+        notify(
+          "领克任务失败",
+          "凭证已过期",
+          "请在领克 App 内退出登录并重新登录，以更新 refreshToken"
+        );
+        await sendPushPlus("lynkco分享诊断", buildReportHtml());
+        $done({});
+        return;
+      }
     }
-
-    pushSummary.tokenStatus = "✔ 刷新成功";
     log("Business accessToken = " + mask(accessToken, 12, 8));
 
     await doDailySign(accessToken);

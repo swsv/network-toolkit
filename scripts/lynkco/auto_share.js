@@ -9,7 +9,7 @@
 4. 诊断报告多端推送：集成 PushPlus 微信通知与系统本地通知，生成立体化诊断卡片。
 */
 
-const SCRIPT_VERSION = "2026-09-01-loon-refresh-sign-share-pushplus-v4";
+const SCRIPT_VERSION = "2026-09-02";
 
 /* =========================
  * LPX Plugin Arguments & PushPlus
@@ -131,8 +131,8 @@ const H5_HOST = "https://h5.lynkco.com";
 const APP_API_GW_HOST = "https://app-api-gw-toc.lynkco.com";
 const OAUTH_HOST = "https://app-services.lynkco.com.cn";
 
-const APP_VERSION = "4.2.6";
-const APP_BUILD = "40206033";
+const APP_VERSION = "4.2.7";
+const APP_BUILD = "40207132";
 
 const EP_REFRESH = "/auth/login/refresh";
 const EP_DAILY_SIGN = "/up/api/v1/user/sign/upgrade";

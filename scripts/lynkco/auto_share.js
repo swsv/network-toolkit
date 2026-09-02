@@ -1252,7 +1252,11 @@ function handleHttpResponse() {
     notify("领克活跃 Token 已更新", "已捕获 accessToken", "可用于执行今日签到与分享");
   }
 
-  $done({});
+  if (typeof $response !== "undefined" && $response && $response.body) {
+    $done({ body: $response.body });
+  } else {
+    $done({});
+  }
 }
 
 /* =========================

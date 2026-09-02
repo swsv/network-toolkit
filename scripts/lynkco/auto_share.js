@@ -108,6 +108,7 @@ const STORE_DEVICE_ID = "lynkco_device_id";
 const STORE_GL_DEV_ID = "lynkco_gl_dev_id";
 const STORE_ACCESS_TOKEN = "lynkco_access_token";
 const STORE_ACCESS_TOKEN_DAY = "lynkco_access_token_day";
+const STORE_TOKEN_TS = "lynkco_token_ts";
 
 const STORE_USED_IDS = "lynkco_used_article_ids";
 
@@ -1141,20 +1142,39 @@ async function doArticleShare(token, shareCode) {
 }
 
 /* =========================
- * Passive Capture
- * 这里只保留 /auth/login/refresh 的抓取。
+ * Passive Capture (v2 — 兼容 4.2.7+)
+ * 从 App 日常请求中捕获活跃 Token。
+ * 支持 /auth/login/refresh (旧版冷启) 和
+ * app-api-gw-toc.lynkco.com (新版 H5 WebView)。
  * ========================= */
 function handleHttpRequest() {
   const url = $request.url || "";
   const headers = $request.headers || {};
   const query = parseUrlQuery(url);
-  const deviceInfo = extractDeviceInfoFromUrlOrHeaders(url, headers);
-
-  log("HTTP_REQUEST URL = " + url);
-  log("SCRIPT_VERSION = " + SCRIPT_VERSION);
 
   const token = getHeader(headers, "token");
-  const svcsid = getHeader(headers, "svcsid");
+
+  if (!token) {
+    $done({});
+    return;
+  }
+
+  const oldToken = read(STORE_TOKEN) || "";
+
+  if (token !== oldToken) {
+    write(token, STORE_TOKEN);
+    write(token, STORE_ACCESS_TOKEN);
+    write(token, STORE_SVCSID);
+    write(String(Date.now()), STORE_TOKEN_TS);
+    write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
+    log("活跃 Token 已捕获: " + mask(token, 12, 8));
+    notify("领克 Token 已捕获", "打开App时自动保存", "Cron 将使用此 Token 执行签到分享");
+  }
+
+  const glDevId = getHeader(headers, "gl_dev_id") || getHeader(headers, "glDevId") || "";
+  if (glDevId) {
+    write(glDevId, STORE_GL_DEV_ID);
+  }
 
   const refreshToken =
     query.refreshToken ||
@@ -1163,35 +1183,15 @@ function handleHttpRequest() {
     getHeader(headers, "refreshtoken") ||
     "";
 
-  if (token) {
-    write(token, STORE_TOKEN);
-    log("token saved = " + mask(token, 12, 8));
-  }
-
-  if (svcsid) {
-    write(svcsid, STORE_SVCSID);
-    log("svcsid saved = " + mask(svcsid, 12, 8));
-  }
-
-  if (deviceInfo.deviceId) {
-    write(deviceInfo.deviceId, STORE_DEVICE_ID);
-    log("deviceId saved = " + mask(deviceInfo.deviceId, 8, 6));
-  }
-
-  if (deviceInfo.glDevId) {
-    write(deviceInfo.glDevId, STORE_GL_DEV_ID);
-    log("gl_dev_id saved = " + mask(deviceInfo.glDevId, 8, 6));
-  }
-
   if (refreshToken) {
     write(refreshToken, STORE_REFRESH_TOKEN);
-    log("refreshToken saved from request = " + mask(refreshToken, 12, 8));
+    log("长效 refreshToken 已捕获: " + mask(refreshToken, 12, 8));
+    notify("领克长效凭证已更新", "已保存 refreshToken", "支持长效全自动续期");
   }
 
-  if (refreshToken) {
-    notify("领克长效凭证已更新", "已保存 refreshToken", "支持长效全自动续期");
-  } else if (token || svcsid) {
-    notify("领克活跃 Token 已更新", "已捕获 accessToken", "可用于执行今日签到与分享");
+  const deviceId = query.deviceId || query.deviceid || getHeader(headers, "deviceId") || "";
+  if (deviceId) {
+    write(deviceId, STORE_DEVICE_ID);
   }
 
   $done({});
@@ -1199,64 +1199,80 @@ function handleHttpRequest() {
 
 function handleHttpResponse() {
   const url = ($request && $request.url) || "";
-  const reqHeaders = ($request && $request.headers) || {};
-  const body = ($response && $response.body) || "";
+  let body = ($response && $response.body) || "";
+
+  /* ---- 方案 A：打开 App 预加载容器秒自动签到 (index.html 注入) ---- */
+  if (url.indexOf("lynkco3-cordova/index.html") !== -1) {
+    if (body.indexOf("</body>") !== -1 && body.indexOf("LYNKCO_AUTO_SIGN_DATE") === -1) {
+      const bgSignScript = '<script>' +
+        'document.addEventListener("deviceready", function() {' +
+        '  setTimeout(function() {' +
+        '    try {' +
+        '      var d = new Date(Date.now() + 28800000);' +
+        '      var today = d.getUTCFullYear() + "-" + String(d.getUTCMonth() + 1).padStart(2, "0") + "-" + String(d.getUTCDate()).padStart(2, "0");' +
+        '      var last = localStorage.getItem("LYNKCO_AUTO_SIGN_DATE") || "";' +
+        '      if (last === today) return;' +
+        '      if (window.cordova && typeof cordova.exec === "function") {' +
+        '        var signUrl = "https://app-api-gw-toc.lynkco.com/up/api/v1/user/sign/upgrade";' +
+        '        var signOpts = { body: "{}", method: "POST", headers: { use_security: "true" }, apiHostEnable: true };' +
+        '        cordova.exec(function(res) {' +
+        '          console.log("[Loon-AutoSign] 打开App静默签到成功: " + JSON.stringify(res));' +
+        '          localStorage.setItem("LYNKCO_AUTO_SIGN_DATE", today);' +
+        '        }, function(err) {' +
+        '          console.log("[Loon-AutoSign] 打开App静默签到回执: " + JSON.stringify(err));' +
+        '        }, "SWNetworkPlugin", "request", [signUrl, signOpts]);' +
+        '      }' +
+        '    } catch(e) {' +
+        '      console.log("[Loon-AutoSign] 异常: " + e);' +
+        '    }' +
+        '  }, 1200);' +
+        '}, false);' +
+        '</script>';
+      body = body.replace("</body>", bgSignScript + "</body>");
+      log("✔ 成功向 App 基础容器注入「打开 App 即秒签到」补丁！");
+      notify("领克自动签到就绪", "打开 App 即可秒自动完成签到", "免点击签到页，原生后台执行");
+      $done({ body: body });
+      return;
+    }
+    $done({ body: body });
+    return;
+  }
+
+  /* ---- 方案 B：签到专属页双重保障注入 (pages-sign-index) ---- */
+  if (url.indexOf("pages-sign-index") !== -1) {
+    const targetCode = "t.init(),t.first=!1,t.isLogin=!0";
+    if (body.indexOf(targetCode) !== -1) {
+      const autoSignCode = 't.init(),t.first=!1,t.isLogin=!0,setTimeout(function(){try{t.showGuidePopup=false;uni.setStorageSync("LYNKCO_APP_SIGN_GUIDE_POPUP_DISPLAY","1");if(!t.daySignStatus&&typeof t.sign==="function"){console.log("[Loon-AutoSign] 发现今日未签到，自动触发原生签名签到！");t.sign();}}catch(e){console.log("[Loon-AutoSign] 自动签到异常:"+e);}},800)';
+      body = body.replace(targetCode, autoSignCode);
+      log("✔ 成功向签到页面 JS 注入「打开秒自动签到」增强补丁！");
+      $done({ body: body });
+      return;
+    }
+    $done({ body: body });
+    return;
+  }
+
+  /* ---- 原有凭证解析逻辑 ---- */
   const obj = parseJsonSafe(body);
-  const query = parseUrlQuery(url);
-  const deviceInfo = extractDeviceInfoFromUrlOrHeaders(url, reqHeaders);
-
-  log("HTTP_RESPONSE URL = " + url);
-  log("SCRIPT_VERSION = " + SCRIPT_VERSION);
-
-  const refreshTokenFromUrl =
-    query.refreshToken ||
-    query.refreshtoken ||
-    "";
-
-  if (deviceInfo.deviceId) {
-    write(deviceInfo.deviceId, STORE_DEVICE_ID);
-    log("deviceId saved from response request = " + mask(deviceInfo.deviceId, 8, 6));
-  }
-
-  if (deviceInfo.glDevId) {
-    write(deviceInfo.glDevId, STORE_GL_DEV_ID);
-    log("gl_dev_id saved from response request = " + mask(deviceInfo.glDevId, 8, 6));
-  }
-
-  if (refreshTokenFromUrl) {
-    write(refreshTokenFromUrl, STORE_REFRESH_TOKEN);
-    log("refreshToken saved from response url = " + mask(refreshTokenFromUrl, 12, 8));
-  }
-
   const refreshToken = extractRefreshTokenFromBody(obj);
   const accessToken = extractAccessTokenFromBody(obj);
 
-  log("auth refresh response body = " + String(body || "").slice(0, 1200));
-
   if (refreshToken) {
     write(refreshToken, STORE_REFRESH_TOKEN);
-    log("refreshToken saved from response body = " + mask(refreshToken, 12, 8));
+    log("长效 refreshToken 从响应体捕获: " + mask(refreshToken, 12, 8));
+    notify("领克长效凭证已更新", "已保存 refreshToken", "支持长效全自动续期");
   }
 
   if (accessToken) {
     write(accessToken, STORE_ACCESS_TOKEN);
     write(accessToken, STORE_TOKEN);
     write(accessToken, STORE_SVCSID);
+    write(String(Date.now()), STORE_TOKEN_TS);
     write(formatGmt8Day(Date.now()), STORE_ACCESS_TOKEN_DAY);
-    log("accessToken saved from response body = " + mask(accessToken, 12, 8));
+    log("accessToken 从响应体捕获: " + mask(accessToken, 12, 8));
   }
 
-  if (refreshTokenFromUrl || refreshToken) {
-    notify("领克长效凭证已更新", "已保存 refreshToken", "支持长效全自动续期");
-  } else if (accessToken) {
-    notify("领克活跃 Token 已更新", "已捕获 accessToken", "可用于执行今日签到与分享");
-  }
-
-  if (typeof $response !== "undefined" && $response && $response.body) {
-    $done({ body: $response.body });
-  } else {
-    $done({});
-  }
+  $done({});
 }
 
 /* =========================
@@ -1449,28 +1465,44 @@ async function runCron() {
 
   try {
     pushSummary.timeStr = formatGmt8Time(Date.now());
-    let accessToken = await refreshAccessTokenStrict();
 
-    if (accessToken) {
-      pushSummary.tokenStatus = "✔ 自动续期成功";
-    } else {
-      // 容错回退：尝试读取已捕获的活跃 Token
-      const fallbackToken = read(STORE_ACCESS_TOKEN) || read(STORE_TOKEN) || read(STORE_SVCSID) || "";
-      if (fallbackToken) {
-        log("Refresh 失败，但检测到已捕获的活跃 Token: " + mask(fallbackToken, 12, 8));
-        accessToken = fallbackToken;
-        pushSummary.tokenStatus = "⚡ 活跃Token直连 (需在App重新登录以获取长效RefreshToken)";
-      } else {
-        pushSummary.tokenStatus = "❌ 凭证缺失或过期";
-        notify(
-          "领克任务失败",
-          "凭证已过期",
-          "请在领克 App 内退出登录并重新登录，以更新 refreshToken"
-        );
-        await sendPushPlus("lynkco分享诊断", buildReportHtml());
-        $done({});
-        return;
+    /* ---- 获取可用 Token ---- */
+    let accessToken = "";
+
+    // 策略 1: 尝试 refreshToken 自动续期 (旧版 App 或已有长效凭证)
+    const hasRefresh = read(STORE_REFRESH_TOKEN) || "";
+    const hasDevice = read(STORE_DEVICE_ID) || "";
+    if (hasRefresh && hasDevice) {
+      accessToken = await refreshAccessTokenStrict();
+      if (accessToken) {
+        pushSummary.tokenStatus = "✔ 自动续期成功";
       }
+    }
+
+    // 策略 2: 使用从 App 打开时捕获的活跃 Token
+    if (!accessToken) {
+      const capturedToken = read(STORE_TOKEN) || read(STORE_ACCESS_TOKEN) || "";
+      const capturedTs = parseInt(read(STORE_TOKEN_TS) || "0", 10);
+      const ageMinutes = capturedTs > 0 ? Math.round((Date.now() - capturedTs) / 60000) : -1;
+
+      if (capturedToken) {
+        log("使用捕获的活跃 Token (捕获于 " + ageMinutes + " 分钟前): " + mask(capturedToken, 12, 8));
+        accessToken = capturedToken;
+        pushSummary.tokenStatus = "⚡ 活跃Token (App捕获, " + ageMinutes + "分钟前)";
+      }
+    }
+
+    // 无可用 Token
+    if (!accessToken) {
+      pushSummary.tokenStatus = "❌ 无可用凭证";
+      notify(
+        "领克任务失败",
+        "无可用 Token",
+        "请先打开领克 App 让脚本自动捕获 Token，然后等待 Cron 执行"
+      );
+      await sendPushPlus("lynkco分享诊断", buildReportHtml());
+      $done({});
+      return;
     }
     log("Business accessToken = " + mask(accessToken, 12, 8));
 

@@ -1,0 +1,26 @@
+#!name=领克每日签到与分享
+#!desc=打开领克App自动抓取Token、每日签到、自动完成文章分享任务得积分、PushPlus 微信通知
+#!author=swsv
+#!homepage=https://github.com/swsv/network-toolkit
+#!version=2026-09-07-v1
+#!system=iOS,iPadOS,macOS
+#!loon_version=3.2.1
+#!tag=领克,签到,分享任务,PushPlus
+
+[Argument]
+pushToken = input,"",tag=PushPlus Token,desc=PushPlus 网站获取的一对一 Token(用于微信推送)
+pushTopic = input,"",tag=PushPlus 群组(可选),desc=群组编码(若填则推送到群组，不填则一对一推送)
+notifyOnSuccess = switch,true,tag=Loon 本地通知,desc=任务执行完成后是否弹出系统本地通知
+
+[Script]
+# 1. 打开 App 即自动捕获活跃 Token (覆盖首页探索、用户认证、H5容器各请求)
+http-request ^https:\/\/(app-api-gw-toc\.lynkco\.com|app-services\.lynkco\.com\.cn)\/(app\/explore|auth\/oauth2|auth\/user|auth\/login|up\/api\/v1).* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=false, timeout=10, tag=领克捕获Token, enable=true
+
+# 2. 捕获认证响应中的长效 refreshToken
+http-response ^https:\/\/app-services\.lynkco\.com\.cn\/auth\/login\/(refresh|mobileCodeLogin|onekey\/mobileLogin|login).* script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, requires-body=true, timeout=30, tag=领克抓LoginResponse, enable=true
+
+# 3. 定时自动签到与分享得积分任务
+cron "23 8,20 * * *" script-path=https://raw.githubusercontent.com/swsv/network-toolkit/redpanda/scripts/lynkco/auto_share.js, timeout=90, tag=领克每日签到与分享, argument=[{pushToken},{pushTopic},{notifyOnSuccess}], enable=true
+
+[MITM]
+hostname = h5-api.lynkco.com, h5.lynkco.com, app-services.lynkco.com.cn, app-api-gw-toc.lynkco.com

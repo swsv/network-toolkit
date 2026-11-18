@@ -9,7 +9,7 @@
 4. 诊断报告多端推送：集成 PushPlus 微信通知与系统本地通知，生成立体化诊断卡片。
 */
 
-const SCRIPT_VERSION = "2026-09-07-v1";
+const SCRIPT_VERSION = "2026-11-18-v1";
 
 /* =========================
  * LPX Plugin Arguments & PushPlus
@@ -117,6 +117,7 @@ const STORE_SHARE_CODE_DAY = "lynkco_share_code_day";
 const STORE_SHARE_CODE_SOURCE = "lynkco_share_code_source";
 const STORE_SHARE_CODE_ARTICLE_ID = "lynkco_share_code_article_id";
 const STORE_SHARE_URL = "lynkco_share_url";
+const STORE_SCENE_SECRET_SIGN_IN = "lynkco_scene_secret_sign_in";
 
 /* =========================
  * Constants
@@ -126,6 +127,13 @@ const APP_ID = "59701c08ed454a43a9b";
 
 const CA_KEY = "204644386";
 const CA_SECRET = "QCl7udM3PB9cOIOwquwPglikFQnzJRsX";
+
+// 从 v4.3.1 原生 libkeyvault.so 提取的两组 KeyVault 槽位密钥 (外加 H5 兜底)
+const NATIVE_CA_PAIRS = [
+  { name: "native-slot1", key: "203760416", secret: "e1msl9aqd101gfcjpo873hrs5jg752og" },
+  { name: "native-slot2", key: "203815550", secret: "ww9kf39hmnzib5zyp6puy9468z7n4w6d" },
+  { name: "h5-legacy",    key: CA_KEY,      secret: CA_SECRET }
+];
 
 const H5_API_HOST = "https://h5-api.lynkco.com";
 const H5_HOST = "https://h5.lynkco.com";
@@ -137,6 +145,11 @@ const APP_BUILD = "40207132";
 
 const EP_REFRESH = "/auth/login/refresh";
 const EP_DAILY_SIGN = "/up/api/v1/user/sign/upgrade";
+const EP_DAILY_SIGN_SECURED = "/up/api/v1/user/sign/upgrade/secured";
+const EP_SCENE_SECRET = "/app/signature/secret";
+const SCENE_CODE_SIGN_IN = "SIGN_IN";
+const SCENE_PARAMS_SIGN_IN = '{"path":"/sign/upgrade/secured"}';
+const SCENE_SECRET_TTL_MS = 10 * 60 * 1000;
 const EP_SIGN_DAY_INFO = "/up/api/v1/user/sign/day/info";
 const EP_SIGN_CALENDAR = "/up/api/v1/user/sign/sign/info";
 const EP_SIGN_INFO = "/up/api/v1/userReward/getContinueDaysAndSignCard";
@@ -515,6 +528,17 @@ function hmacSha256Base64(message, key) {
   return base64(mac);
 }
 
+function sha256Hex(message) {
+  return sha256Bytes(utf8Bytes(message))
+    .map(b => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+function computeSceneSignature(timestamp, nonce, paramsStr, sceneCode, secret) {
+  const payload = `${timestamp}|${nonce}|${paramsStr}|${sceneCode}|${secret}`;
+  return sha256Hex(payload);
+}
+
 /* =========================
  * Signature
  * ========================= */
@@ -559,9 +583,12 @@ function canonicalizePathForSign(pathWithQuery) {
   return path + "?" + canonicalQuery;
 }
 
-function buildSignedHeaders(method, pathWithQuery, token) {
-  const timestamp = String(Date.now());
-  const nonce = uuid();
+function buildSignedHeaders(method, pathWithQuery, token, options) {
+  const opts = options || {};
+  const caKey = opts.caKey || CA_KEY;
+  const caSecret = opts.caSecret || CA_SECRET;
+  const timestamp = String(opts.timestamp || Date.now());
+  const nonce = opts.nonce || uuid();
 
   const accept = "*/*";
   const contentType = "application/json";
@@ -573,23 +600,23 @@ function buildSignedHeaders(method, pathWithQuery, token) {
     "",
     contentType,
     "",
-    `X-Ca-Key:${CA_KEY}`,
+    `X-Ca-Key:${caKey}`,
     `X-Ca-Nonce:${nonce}`,
     "X-Ca-Signature-Method:HmacSHA256",
     `X-Ca-Timestamp:${timestamp}`,
     signPath
   ].join("\n");
 
-  const signature = hmacSha256Base64(stringToSign, CA_SECRET);
+  const signature = hmacSha256Base64(stringToSign, caSecret);
 
-  log("Sign " + method.toUpperCase() + " signPath = " + signPath);
+  log("Sign " + method.toUpperCase() + " key=" + caKey + " signPath = " + signPath);
 
-  return {
+  const headers = {
     "token": token || "",
     "svcsid": token || "",
     "content-type": contentType,
     "accept": accept,
-    "x-ca-key": CA_KEY,
+    "x-ca-key": caKey,
     "x-ca-nonce": nonce,
     "x-ca-signature-method": "HmacSHA256",
     "x-ca-timestamp": timestamp,
@@ -605,6 +632,14 @@ function buildSignedHeaders(method, pathWithQuery, token) {
     "appversionname": APP_BUILD,
     "user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Mobile/15E148 x-cordova-platform/ios cordova-6 appVersionCode/" + APP_VERSION + " appVersionName/" + APP_BUILD
   };
+
+  if (opts.extraHeaders && typeof opts.extraHeaders === "object") {
+    for (const k of Object.keys(opts.extraHeaders)) {
+      headers[k] = opts.extraHeaders[k];
+    }
+  }
+
+  return headers;
 }
 
 /* =========================
@@ -694,7 +729,7 @@ async function refreshAccessTokenStrict() {
 /* =========================
  * API Calls
  * ========================= */
-async function apiCall(method, pathWithQuery, token, body) {
+async function apiCall(method, pathWithQuery, token, body, options) {
   const url = APP_API_GW_HOST + pathWithQuery;
 
   log("API request " + method + " " + url);
@@ -702,7 +737,7 @@ async function apiCall(method, pathWithQuery, token, body) {
   const ret = await request(
     method,
     url,
-    buildSignedHeaders(method, pathWithQuery, token),
+    buildSignedHeaders(method, pathWithQuery, token, options),
     body
   );
 
@@ -714,6 +749,110 @@ async function apiCall(method, pathWithQuery, token, body) {
     obj: parseJsonSafe(ret.data),
     raw: ret.data || ""
   };
+}
+
+function isSignResponseSuccess(ret) {
+  if (!ret || ret.status !== 200) return false;
+  const obj = ret.obj || {};
+  const code = String(obj.code || "").toLowerCase();
+  const text = JSON.stringify(obj);
+  return (
+    code === "success" ||
+    code === "200" ||
+    obj.success === true ||
+    text.includes("签到成功") ||
+    text.includes("操作成功") ||
+    Boolean(obj.data && obj.data.todayFirstSign === true)
+  );
+}
+
+function loadCachedSceneSecret(sceneCode) {
+  try {
+    const raw = read(STORE_SCENE_SECRET_SIGN_IN);
+    if (!raw) return null;
+    const cached = JSON.parse(raw);
+    if (!cached || cached.sceneCode !== sceneCode || !cached.secret) return null;
+    if (Date.now() - Number(cached.ts || 0) >= SCENE_SECRET_TTL_MS) return null;
+    return cached;
+  } catch (e) {
+    return null;
+  }
+}
+
+function parseSceneSecretResponse(ret, sceneCode) {
+  if (!ret || ret.status < 200 || ret.status > 299) return "";
+  const obj = ret.obj || {};
+  const code = String(obj.code || "").toLowerCase();
+  const codeOk = code === "success" || code === "200" || code === "0" || obj.success === true;
+  if (!codeOk || !obj.data || typeof obj.data !== "object") return "";
+  const respScene = String(obj.data.sceneCode || "");
+  if (respScene && respScene.toLowerCase() !== sceneCode.toLowerCase()) return "";
+  const secret = String(obj.data.secret || "").trim();
+  return secret;
+}
+
+async function fetchSceneSecret(token, sceneCode, forceReload) {
+  if (!forceReload) {
+    const cached = loadCachedSceneSecret(sceneCode);
+    if (cached) {
+      log("Using cached scene secret (" + cached.caName + ", key=" + cached.caKey + ")");
+      return cached;
+    }
+  }
+
+  for (const pair of NATIVE_CA_PAIRS) {
+    log("Fetching scene secret (" + sceneCode + ") with " + pair.name + " key=" + pair.key);
+    try {
+      const ret = await apiCall("GET", EP_SCENE_SECRET, token, undefined, {
+        caKey: pair.key,
+        caSecret: pair.secret,
+        extraHeaders: { "x-scene-code": sceneCode }
+      });
+      const secret = parseSceneSecretResponse(ret, sceneCode);
+      if (secret) {
+        const info = {
+          sceneCode: sceneCode,
+          secret: secret,
+          caKey: pair.key,
+          caSecret: pair.secret,
+          caName: pair.name,
+          ts: Date.now()
+        };
+        write(JSON.stringify(info), STORE_SCENE_SECRET_SIGN_IN);
+        log("Scene secret loaded (" + pair.name + ", len=" + secret.length + ", secret=" + mask(secret, 4, 4) + ")");
+        return info;
+      }
+    } catch (e) {
+      log("Scene secret request error (" + pair.name + ") = " + e);
+    }
+  }
+
+  return null;
+}
+
+async function callSecuredSignOnce(token, secretInfo, useRxHttpStyle) {
+  const timestamp = String(Date.now());
+  const nonce = uuid();
+  const paramsStr = useRxHttpStyle ? "{}" : SCENE_PARAMS_SIGN_IN;
+  const xSignature = computeSceneSignature(timestamp, nonce, paramsStr, SCENE_CODE_SIGN_IN, secretInfo.secret);
+  const extraHeaders = useRxHttpStyle
+    ? { "x-timestamp": timestamp, "x-nonce": nonce, "x-signature": xSignature }
+    : { "x-signature": xSignature };
+
+  log(
+    "Secured sign attempt (" +
+    (useRxHttpStyle ? "RxHttp-style" : "Gateway-style") +
+    ", key=" + secretInfo.caKey +
+    ", params=" + paramsStr + ")"
+  );
+
+  return await apiCall("POST", EP_DAILY_SIGN_SECURED, token, {}, {
+    caKey: secretInfo.caKey,
+    caSecret: secretInfo.caSecret,
+    timestamp: timestamp,
+    nonce: nonce,
+    extraHeaders: extraHeaders
+  });
 }
 
 async function doDailySign(token) {
@@ -730,32 +869,46 @@ async function doDailySign(token) {
     return true;
   }
 
-  // 2. 执行签到
-  log("Executing sign request: " + EP_DAILY_SIGN);
-  const ret = await apiCall("POST", EP_DAILY_SIGN, token, {});
-  const obj = ret.obj || {};
-  const code = String(obj.code || "");
-  const text = JSON.stringify(obj);
+  // 2. 获取 SIGN_IN 场景动态密钥并执行 v4.3.1 加密签到
+  let ret = null;
+  let secretInfo = await fetchSceneSecret(token, SCENE_CODE_SIGN_IN, false);
 
-  // 3. 同步日历
+  if (secretInfo) {
+    ret = await callSecuredSignOnce(token, secretInfo, false);
+
+    // 若动态密钥已轮转 (code=40002)，刷新密钥后重试一次
+    if (ret && ret.obj && String(ret.obj.code || "") === "40002") {
+      log("Scene secret rotated (40002), reloading...");
+      secretInfo = await fetchSceneSecret(token, SCENE_CODE_SIGN_IN, true);
+      if (secretInfo) {
+        ret = await callSecuredSignOnce(token, secretInfo, false);
+      }
+    }
+
+    // 若网关拦截器风格未命中成功，补测一次 RxHttp SignatureInterceptor 头风格
+    if (!isSignResponseSuccess(ret) && secretInfo) {
+      const rxRet = await callSecuredSignOnce(token, secretInfo, true);
+      if (isSignResponseSuccess(rxRet) || (rxRet && rxRet.status === 200)) {
+        ret = rxRet;
+      }
+    }
+  } else {
+    // 3. 若场景密钥接口不可用，回退旧版签到路径兜底
+    log("Scene secret unavailable, fallback to legacy sign request: " + EP_DAILY_SIGN);
+    ret = await apiCall("POST", EP_DAILY_SIGN, token, {});
+  }
+
+  ret = ret || { status: 0, obj: {}, raw: "" };
+  const obj = ret.obj || {};
+
+  // 4. 同步日历
   try {
     const nowTs = Date.now();
     const calBody = { startDate: nowTs - 5 * 86400000, endDate: nowTs + 30 * 86400000 };
     await apiCall("POST", EP_SIGN_CALENDAR, token, calBody);
   } catch (e) {}
 
-  const signSuccess =
-    ret.status === 200 &&
-    (
-      code === "success" ||
-      code === "200" ||
-      obj.success === true ||
-      text.includes("签到成功") ||
-      text.includes("操作成功") ||
-      (obj.data && obj.data.todayFirstSign === true)
-    );
-
-  if (signSuccess) {
+  if (isSignResponseSuccess(ret)) {
     const data = obj.data || {};
     const tip = data.messageTip || obj.message || "签到成功";
     notify("领克签到成功", tip, "获得能量:" + (data.rewardEnergyNumber || 0));
@@ -764,7 +917,7 @@ async function doDailySign(token) {
     return true;
   }
 
-  // 4. 签到接口网关拦截时，再次核验日历状态
+  // 5. 签到接口网关拦截时，再次核验日历状态
   const checkRet = await apiCall("GET", EP_SIGN_DAY_INFO, token);
   const checkObj = checkRet.obj || {};
   if (checkRet.status === 200 && checkObj.data && Number(checkObj.data.signStatus) === 1) {
@@ -775,7 +928,7 @@ async function doDailySign(token) {
 
   log("Daily sign failed, status=" + ret.status);
   pushSummary.signStatus = ret.status === 403 ? "⚠️ 网关限制原生调用 (需在App点签到)" : "❌ 签到未成功";
-  pushSummary.signDetail = ret.status === 403 ? "HTTP 403 (不影响后续文章分享得积分)" : (obj.message || "失败");
+  pushSummary.signDetail = ret.status === 403 ? "HTTP 403 (不影响后续文章分享得积分)" : (obj.message || "HTTP " + ret.status);
   return false;
 }
 
